@@ -160,19 +160,24 @@ export class GlitchRenderer {
         const offscreen = new OffscreenCanvas(this.width, this.height);
         const ctx = offscreen.getContext('2d');
 
-        // Desaturate to grayscale for monochrome aesthetic
-        ctx.filter = 'grayscale(100%) contrast(1.2) brightness(0.8)';
-
         // Fill canvas, maintaining aspect ratio (cover mode)
+        // Mirror horizontally so selfie matches camera preview
         const scale = Math.max(this.width / img.width, this.height / img.height);
         const w = img.width * scale;
         const h = img.height * scale;
         const x = (this.width - w) / 2;
         const y = (this.height - h) / 2;
-        ctx.drawImage(img, x, y, w, h);
+        ctx.save();
+        ctx.translate(this.width, 0);
+        ctx.scale(-1, 1);
+        ctx.drawImage(img, this.width - x - w, y, w, h);
+        ctx.restore();
 
         const bitmap = offscreen.transferToImageBitmap();
         this.sourceImages.push(bitmap);
+        // Make the newly loaded image the active source
+        this.sourceImage = bitmap;
+        this.currentImageIdx = this.sourceImages.length - 1;
         resolve();
       };
       img.onerror = reject;
@@ -231,12 +236,6 @@ export class GlitchRenderer {
     }
 
     // ---- GLITCH EFFECTS ----
-
-    // Swap images during intense glitch (every ~2 seconds)
-    if (intensity > 0.7 && t - this.lastSwapTime > 2) {
-      this.nextImage();
-      this.lastSwapTime = t;
-    }
 
     // Always-on: subtle scan lines
     this.drawScanLines(ctx, w, h, 0.15 + intensity * 0.3);

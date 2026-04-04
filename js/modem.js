@@ -50,7 +50,7 @@ const PORTAMENTO = 0.0;
 
 // Waveform: 'sine' = pure tone, 'saw' = buzzy/nasal, 'square' = hollow/reedy,
 //           'triangle' = soft/mellow
-const WAVEFORM = 'triangle';
+const WAVEFORM = 'sine';
 
 // ---- TWEAK THESE ----
 const MOD_COMPONENTS = [

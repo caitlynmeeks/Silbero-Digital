@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SILBERO DIGITAL // OPERATOR</title>
+  <link rel="stylesheet" href="css/operator.css">
+</head>
+<body>
+  <div id="operator">
+    <!-- Top: camera grid -->
+    <!-- Camera feeds created dynamically as terminals connect -->
+    <div id="camera-grid"></div>
+
+    <!-- Full-screen examine view (hidden by default) -->
+    <div id="examine-view" class="hidden">
+      <canvas id="examine-canvas" width="640" height="480"></canvas>
+      <div id="examine-label">T--</div>
+      <div id="examine-close">ESC</div>
+    </div>
+
+    <!-- Bottom: swim lanes for all decoded messages -->
+    <div id="operator-lanes"></div>
+
+    <!-- Footer: printer + status -->
+    <div id="operator-footer">
+      <button id="btn-op-printer">CONNECT PRINTER</button>
+      <span id="op-printer-status">NO PRINTER</span>
+      <span id="op-ws-status">WS:--</span>
+      <span id="op-stats">0 messages</span>
+    </div>
+  </div>
+
+  <script type="module" src="js/operator.js"></script>
+</body>
+</html>

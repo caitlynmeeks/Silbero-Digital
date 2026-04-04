@@ -1,119 +1,226 @@
 /**
- * Silbo Terminal — Main application (Modem Edition)
+ * Silbero Digital — Main application (WebSocket Relay Edition)
  *
- * Classic FSK modem encoding/decoding with glitched Silbo Gomero imagery.
- * The modem screech is the medium; the whistler images are the metaphor.
+ * Messages are encoded as modem audio, played locally, and relayed
+ * via WebSocket to all other terminals. Receiving terminals play
+ * the incoming audio and decode it simultaneously. Multiple incoming
+ * transmissions overlap in parallel "swim lanes" — the chaos is the point.
  *
- * Audio pipeline:
- *   [keyboard] -> modem FSK encoder -> speaker
- *   microphone -> Goertzel detector -> FSK decoder -> display + printer
+ * Pipeline:
+ *   [keyboard] -> modem encoder -> play locally + send via WebSocket
+ *   WebSocket incoming -> play audio + decode -> swim lane display + printer
  */
 
 import {
-  encodeMessage, decodeMessage, detectCarrier,
-  loopbackTest, generateHandshake, getFreqs,
-  SAMPLE_RATE, BAUD_RATE, FREQ_PLAN
-} from './modem.js';
+  synthesizeSilbo, playSilbo, playSilboAsync, getWaveform,
+  SAMPLE_RATE, MAX_MESSAGE_LENGTH
+} from './silbo-synth.js';
 import { GlitchRenderer } from './glitch.js';
 import { ThermalPrinter } from './thermal-printer.js';
+import { captureSelfie } from './camera.js';
+import { collectFingerprint, TypingBiometrics, BehaviorTracker, estimateHandedness } from './fingerprint.js';
+import { setLanguage, t, getLang } from './i18n.js';
+
+// Binary message type bytes (for selfie relay)
+const MSG_FACE_SNAP = 0x03;
 
 // ---- State ----
 let audioCtx = null;
-let micStream = null;
-let analyserNode = null;
-let micProcessor = null;
-let terminalId = 1;
-let listenTo = [1, 2, 3, 4, 5];
+let terminalId = 0;  // Assigned by server or random
 let isTransmitting = false;
-let isListening = false;
 let printer = null;
 let glitch = null;
-
-// Circular buffer for incoming audio (8 seconds — modem messages are longer)
-const MIC_BUFFER_SECONDS = 8;
-let micBuffer = null;
-let micBufferWritePos = 0;
+let ws = null;
+let wsConnected = false;
+let camera = null;
+let consentData = false;
+let consentPrivacy = false;
+let userName = '';
+let userTag = '';
+let displayName = '';
+let selfieBlob = null;
+let selfieDataUrl = null;
+let fingerprint = null;
+const typing = new TypingBiometrics();
+const behavior = new BehaviorTracker();
 
 // ---- DOM refs ----
+const elSplash = document.getElementById('splash');
+const elNamePrompt = document.getElementById('name-prompt');
+const elTerminal = document.getElementById('terminal');
 const elTerminalId = document.getElementById('terminal-id');
 const elStatus = document.getElementById('status');
-const elMessages = document.getElementById('messages');
+const elWsStatus = document.getElementById('ws-status');
+const elChatLog = document.getElementById('chat-log');
 const elInput = document.getElementById('input');
-const elConfigPanel = document.getElementById('config-panel');
-const elBtnConfig = document.getElementById('btn-config');
-const elBtnPrinter = document.getElementById('btn-printer');
-const elBtnStart = document.getElementById('btn-start');
-const elPrinterStatus = document.getElementById('printer-status');
-const elInputTerminalId = document.getElementById('input-terminal-id');
-const elListenCheckboxes = document.getElementById('listen-checkboxes');
-const elSpectrogram = document.getElementById('spectrogram');
-const spectrogramCtx = elSpectrogram.getContext('2d', { willReadFrequently: true });
 const elGlitchCanvas = document.getElementById('glitch-canvas');
+const elBtnSend = document.getElementById('btn-send');
+
+// Splash elements
+const elConsentData = document.getElementById('consent-data');
+const elConsentPrivacy = document.getElementById('consent-privacy');
+const elBtnSilbero = document.getElementById('btn-silbero');
+const elInputName = document.getElementById('input-name');
+const elBtnEnter = document.getElementById('btn-enter');
 
 // ---- UI Setup ----
 
 function initUI() {
-  // Build listen checkboxes
-  for (let i = 1; i <= 5; i++) {
-    const label = document.createElement('label');
-    const cb = document.createElement('input');
-    cb.type = 'checkbox';
-    cb.checked = i !== 1;
-    cb.dataset.terminal = i;
-    cb.addEventListener('change', () => { listenTo = getListenTargets(); });
-    label.appendChild(cb);
-    label.appendChild(document.createTextNode(` ${i}`));
-    elListenCheckboxes.appendChild(label);
+  const elLangSelect = document.getElementById('lang-select');
+
+  // Language selector — first screen
+  for (const btn of document.querySelectorAll('.lang-btn')) {
+    btn.addEventListener('click', () => {
+      const lang = btn.dataset.lang;
+      setLanguage(lang);
+      elLangSelect.classList.add('hidden');
+      elSplash.classList.remove('hidden');
+      applyTranslations();
+    });
   }
 
-  elBtnConfig.addEventListener('click', () => {
-    elConfigPanel.classList.toggle('hidden');
+  function applyTranslations() {
+    // Update all translatable text in the splash
+    document.querySelector('#splash-content > .splash-section:nth-child(1) h2').textContent = t('splashTitle');
+    document.querySelector('#splash-content > .splash-section:nth-child(1) p:nth-child(2)').textContent = t('splashDesc1');
+    document.querySelector('#splash-content > .splash-section:nth-child(1) p:nth-child(3)').textContent = t('splashDesc2');
+    document.querySelector('#splash-content > .splash-section:nth-child(2) h2').textContent = t('silboTitle');
+    document.querySelector('#splash-content > .splash-section:nth-child(2) p').textContent = t('silboDesc');
+
+    // Consent labels
+    const consentLabels = document.querySelectorAll('.consent-label span');
+    if (consentLabels[0]) consentLabels[0].innerHTML = `${t('consentData')} <em>${t('consentDataNote')}</em>`;
+    if (consentLabels[1]) consentLabels[1].innerHTML = `${t('consentPrivacy')}`;
+
+    elBtnSilbero.textContent = t('letsSilbero');
+    document.getElementById('splash-footer').textContent = t('splashFooter');
+    document.getElementById('oauth-label').textContent = t('orSignIn');
+
+    // Name prompt
+    document.getElementById('name-label').textContent = t('whatsYourName');
+    document.getElementById('name-hint').textContent = t('leaveBlank');
+    elBtnEnter.textContent = t('enter');
+
+    // Terminal
+    elInput.placeholder = t('placeholder');
+    elBtnSend.textContent = t('send');
+  }
+
+  // Splash screen consent flow
+  function updateSilberoButton() {
+    consentPrivacy = elConsentPrivacy.checked;
+    consentData = elConsentData.checked;
+    elBtnSilbero.disabled = !consentPrivacy;
+  }
+
+  elConsentData.addEventListener('change', updateSilberoButton);
+  elConsentPrivacy.addEventListener('change', updateSilberoButton);
+  updateSilberoButton();
+
+  // Track ToS scroll depth
+  const splashEl = document.getElementById('splash');
+  splashEl.addEventListener('scroll', () => {
+    const depth = splashEl.scrollTop / (splashEl.scrollHeight - splashEl.clientHeight);
+    behavior.recordTosScroll(depth);
   });
 
-  elInputTerminalId.addEventListener('change', () => {
-    terminalId = parseInt(elInputTerminalId.value, 10) || 1;
-    updateHeader();
-    for (const cb of elListenCheckboxes.querySelectorAll('input')) {
-      cb.checked = parseInt(cb.dataset.terminal, 10) !== terminalId;
-    }
-    listenTo = getListenTargets();
+  // Typing biometrics on the input field
+  elInput.addEventListener('keydown', (e) => typing.keydown(e.key));
+  elInput.addEventListener('keyup', (e) => typing.keyup(e.key));
+
+  elBtnSilbero.addEventListener('click', () => {
+    if (!elConsentPrivacy.checked) return;
+
+    // Assign a random terminal ID
+    terminalId = Math.floor(Math.random() * 99999) + 1;
+    // UUID-style tag: 50e800-e29b-41d4a7 format
+    const uuid = crypto.randomUUID().replace(/-/g, '');
+    userTag = `${uuid.slice(0,6)}-${uuid.slice(6,10)}-${uuid.slice(10,16)}`;
+
+    // Show name prompt
+    elSplash.classList.add('hidden');
+    elNamePrompt.classList.remove('hidden');
+    elInputName.value = '';
+    elInputName.placeholder = userTag;
+    elInputName.focus();
   });
 
-  elBtnPrinter.addEventListener('click', connectPrinter);
-  elBtnStart.addEventListener('click', startTerminal);
+  // Name prompt -> selfie -> fingerprint -> terminal
+  async function enterTerminal() {
+    const raw = elInputName.value.trim();
+    userName = raw;
+    displayName = raw ? `${raw} (${userTag})` : userTag;
+    behavior.recordConsent();
 
-  // Text input — auto-start on first Enter
-  elInput.addEventListener('keydown', async (e) => {
-    if (e.key === 'Enter' && !isTransmitting) {
-      const text = elInput.value.trim();
-      if (text.length > 0) {
-        if (!audioCtx) await startTerminal();
-        elInput.value = '';
-        transmitMessage(text);
+    elNamePrompt.classList.add('hidden');
+
+    // Selfie capture (if they consented to data collection)
+    if (consentData) {
+      const result = await captureSelfie('images/whistler4.jpg');
+      if (result) {
+        selfieBlob = result.blob;
+        selfieDataUrl = result.dataUrl;
       }
     }
+
+    // Show terminal
+    elTerminal.classList.remove('hidden');
+
+    // Use selfie for glitch effect instead of stock images
+    if (selfieDataUrl && glitch) {
+      glitch.loadImage(selfieDataUrl).catch(() => {});
+    }
+
+    // Estimate handedness from selfie
+    let handedness = 'unknown';
+    if (selfieBlob) {
+      try {
+        const bmp = await createImageBitmap(selfieBlob);
+        handedness = estimateHandedness(bmp);
+        bmp.close();
+      } catch (e) {}
+    }
+
+    // Collect device fingerprint and display it to the user
+    collectFingerprint().then(fp => {
+      fp.handedness = handedness;
+      fingerprint = fp;
+      displayFingerprint(fp);
+    });
+
+    await startTerminal();
+  }
+
+  elBtnEnter.addEventListener('click', enterTerminal);
+  elInputName.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') enterTerminal();
   });
 
-  // Init glitch renderer
-  elGlitchCanvas.width = 400;
-  elGlitchCanvas.height = 300;
+  // Send button (for mobile) and Enter key
+  async function doSend() {
+    if (isTransmitting) return;
+    const text = elInput.value.trim();
+    if (text.length > 0) {
+      if (!audioCtx) await startTerminal();
+      elInput.value = '';
+      transmitMessage(text);
+    }
+  }
+
+  elBtnSend.addEventListener('click', doSend);
+  elInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') doSend();
+  });
+
+  // Init glitch renderer (sized to sidebar)
+  elGlitchCanvas.width = 320;
+  elGlitchCanvas.height = 240;
   glitch = new GlitchRenderer(elGlitchCanvas);
   glitch.start();
-
-  updateHeader();
-  addSystemMessage('SILBO TERMINAL v0.2 [MODEM] -- type and press Enter, or CONFIG to set up');
-}
-
-function getListenTargets() {
-  const targets = [];
-  for (const cb of elListenCheckboxes.querySelectorAll('input')) {
-    if (cb.checked) targets.push(parseInt(cb.dataset.terminal, 10));
-  }
-  return targets;
 }
 
 function updateHeader() {
-  elTerminalId.textContent = `TERMINAL ${String(terminalId).padStart(2, '0')}`;
+  elTerminalId.textContent = `SILBERO.DIGITAL`;
 }
 
 function setStatus(status) {
@@ -124,145 +231,427 @@ function setStatus(status) {
   else if (status === 'TRANSMITTING') elStatus.classList.add('transmitting');
 }
 
-// ---- Messages ----
+// ---- Data Panel (surveillance made visible) ----
 
-function addMessage(text, source, confidence = 1, isOutgoing = false) {
-  const div = document.createElement('div');
-  div.className = 'message';
-  if (confidence < 0.6) div.classList.add('low-confidence');
+function displayFingerprint(fp) {
+  const panel = document.getElementById('data-panel');
+  if (!panel) return;
 
-  const sourceSpan = document.createElement('span');
-  sourceSpan.className = 'source';
-  sourceSpan.textContent = isOutgoing
-    ? `[T${String(terminalId).padStart(2, '0')} >>] `
-    : `[T${String(source).padStart(2, '0')} <<] `;
+  const rows = [
+    ['NAME', displayName],
+    ['ID', userTag],
+    ['LANG', getLang()?.toUpperCase()],
+    ['IP', fp.ip],
+    ['CITY', [fp.city, fp.region, fp.countryCode].filter(Boolean).join(', ')],
+    ['ISP', fp.isp],
+    ['COORDS', fp.latitude && fp.longitude ? `${fp.latitude}, ${fp.longitude}` : null],
+    ['DEVICE', fp.userAgent?.match(/\(([^)]+)\)/)?.[1]],
+    ['SCREEN', fp.screenWidth && `${fp.screenWidth}x${fp.screenHeight} @${fp.pixelRatio}x`],
+    ['GPU', fp.gpuRenderer],
+    ['CPU', fp.hardwareConcurrency && `${fp.hardwareConcurrency} cores`],
+    ['RAM', fp.deviceMemory && `${fp.deviceMemory} GB`],
+    ['BATTERY', fp.batteryLevel !== undefined ? `${fp.batteryLevel}% ${fp.batteryCharging ? 'CHG' : 'DIS'}` : null],
+    ['NET', [fp.connectionType, fp.downlink && `${fp.downlink}Mbps`].filter(Boolean).join(' ')],
+    ['TZ', fp.timezoneIANA],
+    ['LANGS', fp.languages?.join(', ')],
+    ['DARK', fp.darkMode ? 'YES' : 'NO'],
+    ['DNT', fp.doNotTrack ? 'ENABLED' : 'OFF'],
+    ['HAND', fp.handedness],
+    ['MAC', fp.macAddress],
+    ['CANVAS', fp.canvasFingerprint?.slice(0, 12) + '...'],
+    ['AUDIO', fp.audioFingerprint?.slice(0, 12) + '...'],
+    ['DEVICE#', fp.deviceHash?.slice(0, 12) + '...'],
+    ['FONTS', fp.installedFonts?.length && `${fp.installedFonts.length} detected`],
+  ];
 
-  const textSpan = document.createElement('span');
-  textSpan.className = `text ${isOutgoing ? '' : 'incoming'}`;
-  textSpan.textContent = text;
-
-  div.appendChild(sourceSpan);
-  div.appendChild(textSpan);
-
-  if (!isOutgoing && confidence < 1) {
-    const confSpan = document.createElement('span');
-    confSpan.className = 'confidence';
-    confSpan.textContent = `${Math.round(confidence * 100)}%`;
-    div.appendChild(confSpan);
-  }
-
-  elMessages.appendChild(div);
-  elMessages.scrollTop = elMessages.scrollHeight;
+  panel.innerHTML = rows
+    .filter(([, v]) => v)
+    .map(([label, value]) =>
+      `<div class="data-row"><span class="data-label">${label}:</span> <span class="data-value">${value}</span></div>`
+    )
+    .join('');
 }
 
-function addMessageAnimated(text, source, confidence = 1) {
-  const div = document.createElement('div');
-  div.className = 'message';
-  if (confidence < 0.6) div.classList.add('low-confidence');
+// ---- IRC Chat ----
 
-  const sourceSpan = document.createElement('span');
-  sourceSpan.className = 'source';
-  sourceSpan.textContent = `[T${String(source).padStart(2, '0')} <<] `;
+// Map of known terminal IDs to display names and avatars
+const knownNames = {};
+const knownAvatars = {};  // terminalId -> data URL of selfie
 
-  const textSpan = document.createElement('span');
-  textSpan.className = 'text incoming decoding';
+function timeStamp() {
+  return new Date().toTimeString().slice(0, 8);
+}
 
-  const cursorSpan = document.createElement('span');
-  cursorSpan.className = 'cursor-blink';
-  cursorSpan.textContent = '_';
+/**
+ * Add a chat message to the log. Returns an object with methods to update it.
+ *
+ * @param {string} name - Display name of sender
+ * @param {boolean} isSelf - Is this our own message
+ * @param {Float32Array} samples - Audio samples for waveform
+ * @param {number} sourceId - Terminal ID of sender (for avatar lookup)
+ */
+function addChatMessage(name, isSelf, samples, sourceId) {
+  const msg = document.createElement('div');
+  msg.className = `chat-msg ${isSelf ? 'self' : ''}`;
 
-  div.appendChild(sourceSpan);
-  div.appendChild(textSpan);
-  div.appendChild(cursorSpan);
-  elMessages.appendChild(div);
+  // Avatar + content wrapper
+  const wrapper = document.createElement('div');
+  wrapper.className = 'chat-msg-wrapper';
 
-  let i = 0;
-  const interval = setInterval(() => {
-    if (i < text.length) {
-      textSpan.textContent += text[i];
-      i++;
-      elMessages.scrollTop = elMessages.scrollHeight;
-    } else {
-      clearInterval(interval);
-      cursorSpan.remove();
-      textSpan.classList.remove('decoding');
-      if (confidence < 1) {
-        const confSpan = document.createElement('span');
-        confSpan.className = 'confidence';
+  // Avatar
+  const avatar = document.createElement('div');
+  avatar.className = 'chat-msg-avatar';
+  const avatarUrl = isSelf ? selfieDataUrl : knownAvatars[sourceId];
+  if (avatarUrl) {
+    avatar.style.backgroundImage = `url(${avatarUrl})`;
+  }
+
+  // Content column
+  const content = document.createElement('div');
+  content.className = 'chat-msg-content';
+
+  // Header: name + timestamp
+  const header = document.createElement('div');
+  header.className = 'chat-msg-header';
+
+  const nameSpan = document.createElement('span');
+  nameSpan.className = 'chat-msg-name';
+  nameSpan.textContent = name;
+
+  const timeSpan = document.createElement('span');
+  timeSpan.className = 'chat-msg-time';
+  timeSpan.textContent = timeStamp();
+
+  const confSpan = document.createElement('span');
+  confSpan.className = 'chat-msg-confidence';
+
+  header.appendChild(nameSpan);
+  header.appendChild(timeSpan);
+  header.appendChild(confSpan);
+
+  // Waveform
+  const waveCanvas = document.createElement('canvas');
+  waveCanvas.className = 'chat-msg-waveform';
+  waveCanvas.width = 1200;
+  waveCanvas.height = 80;
+
+  // Text
+  const textDiv = document.createElement('div');
+  textDiv.className = 'chat-msg-text';
+
+  content.appendChild(header);
+  content.appendChild(waveCanvas);
+  content.appendChild(textDiv);
+
+  wrapper.appendChild(avatar);
+  wrapper.appendChild(content);
+  msg.appendChild(wrapper);
+
+  elChatLog.appendChild(msg);
+  elChatLog.scrollTop = elChatLog.scrollHeight;
+
+  return {
+    setText(text) {
+      textDiv.textContent = text;
+      if (samples) drawWaveformProgressive(waveCanvas, samples, 1);
+    },
+
+    animateText(text, msPerChar) {
+      let i = 0;
+      const totalChars = text.length;
+      textDiv.innerHTML = '<span class="cursor">_</span>';
+
+      const interval = setInterval(() => {
+        if (i < totalChars) {
+          textDiv.textContent = text.slice(0, i + 1);
+          const cursor = document.createElement('span');
+          cursor.className = 'cursor';
+          cursor.textContent = '_';
+          textDiv.appendChild(cursor);
+          i++;
+
+          // Progressive waveform reveal — draw up to current position
+          if (samples) {
+            const progress = i / totalChars;
+            drawWaveformProgressive(waveCanvas, samples, progress);
+          }
+
+          elChatLog.scrollTop = elChatLog.scrollHeight;
+
+          // Per-character glitch pulse on avatar
+          avatar.classList.add('glitching');
+          setTimeout(() => avatar.classList.remove('glitching'), msPerChar * 0.6);
+        } else {
+          clearInterval(interval);
+          textDiv.textContent = text;
+          avatar.classList.remove('glitching');
+          // Final full waveform
+          if (samples) drawWaveformProgressive(waveCanvas, samples, 1);
+        }
+      }, msPerChar);
+    },
+
+    setConfidence(confidence) {
+      if (confidence !== undefined) {
         confSpan.textContent = `${Math.round(confidence * 100)}%`;
-        div.appendChild(confSpan);
       }
+    },
+  };
+}
+
+/**
+ * Draw waveform progressively — only renders up to `progress` (0-1).
+ * Reveals left-to-right in sync with text typing.
+ */
+function drawWaveformProgressive(canvas, samples, progress) {
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width;
+  const h = canvas.height;
+  const revealX = Math.floor(w * Math.min(1, progress));
+
+  ctx.fillStyle = '#141414';
+  ctx.fillRect(0, 0, w, h);
+
+  // Center line (full width, dim)
+  ctx.strokeStyle = '#222';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, h / 2);
+  ctx.lineTo(w, h / 2);
+  ctx.stroke();
+
+  if (revealX < 1) return;
+
+  const step = Math.max(1, Math.floor(samples.length / w));
+
+  // Filled envelope — upper
+  ctx.beginPath();
+  ctx.moveTo(0, h / 2);
+  for (let x = 0; x < revealX; x++) {
+    const idx = Math.floor(x * samples.length / w);
+    let rms = 0;
+    for (let j = 0; j < step; j++) {
+      const s = samples[idx + j] || 0;
+      rms += s * s;
     }
-  }, 35); // Faster reveal for modem speed (~28 chars/sec at 300 baud)
+    rms = Math.sqrt(rms / step);
+    ctx.lineTo(x, h / 2 - rms * h * 0.95);
+  }
+  ctx.lineTo(revealX, h / 2);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(180, 180, 180, 0.3)';
+  ctx.fill();
+
+  // Filled envelope — lower
+  ctx.beginPath();
+  ctx.moveTo(0, h / 2);
+  for (let x = 0; x < revealX; x++) {
+    const idx = Math.floor(x * samples.length / w);
+    let rms = 0;
+    for (let j = 0; j < step; j++) {
+      const s = samples[idx + j] || 0;
+      rms += s * s;
+    }
+    rms = Math.sqrt(rms / step);
+    ctx.lineTo(x, h / 2 + rms * h * 0.95);
+  }
+  ctx.lineTo(revealX, h / 2);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(180, 180, 180, 0.2)';
+  ctx.fill();
+
+  // Bright signal trace
+  ctx.beginPath();
+  ctx.moveTo(0, h / 2);
+  for (let x = 0; x < revealX; x++) {
+    const idx = Math.floor(x * samples.length / w);
+    let val = 0;
+    for (let j = 0; j < step; j++) val += samples[idx + j] || 0;
+    val /= step;
+    ctx.lineTo(x, h / 2 - val * h * 1.8);
+  }
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // Playhead indicator at reveal edge
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(revealX, 0);
+  ctx.lineTo(revealX, h);
+  ctx.stroke();
 }
 
 function addSystemMessage(text) {
   const div = document.createElement('div');
-  div.className = 'message system';
-  div.textContent = text;
-  elMessages.appendChild(div);
-  elMessages.scrollTop = elMessages.scrollHeight;
+  div.className = 'chat-system';
+  div.textContent = `[${timeStamp()}] ${text}`;
+  elChatLog.appendChild(div);
+  elChatLog.scrollTop = elChatLog.scrollHeight;
 }
+
+// Keep old name for compatibility
+const addSystemLane = addSystemMessage;
 
 // ---- Audio Engine ----
 
 async function initAudio() {
   audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
   if (audioCtx.state === 'suspended') await audioCtx.resume();
-
-  micStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: false,
-      noiseSuppression: false,
-      autoGainControl: false,
-      sampleRate: SAMPLE_RATE,
-    }
-  });
-
-  const micSource = audioCtx.createMediaStreamSource(micStream);
-
-  analyserNode = audioCtx.createAnalyser();
-  analyserNode.fftSize = 4096;
-  analyserNode.smoothingTimeConstant = 0.7;
-  micSource.connect(analyserNode);
-
-  const bufferSize = 4096;
-  micProcessor = audioCtx.createScriptProcessor(bufferSize, 1, 1);
-
-  micBuffer = new Float32Array(MIC_BUFFER_SECONDS * SAMPLE_RATE);
-  micBufferWritePos = 0;
-
-  micProcessor.onaudioprocess = (e) => {
-    if (!isListening) return;
-    const input = e.inputBuffer.getChannelData(0);
-    for (let i = 0; i < input.length; i++) {
-      micBuffer[micBufferWritePos] = input[i];
-      micBufferWritePos = (micBufferWritePos + 1) % micBuffer.length;
-    }
-    const output = e.outputBuffer.getChannelData(0);
-    output.fill(0);
-  };
-
-  micSource.connect(micProcessor);
-  micProcessor.connect(audioCtx.destination);
   return true;
 }
 
-async function playAudio(samples) {
-  if (!audioCtx) return;
-  if (audioCtx.state === 'suspended') await audioCtx.resume();
+// ---- WebSocket ----
 
-  const buffer = audioCtx.createBuffer(1, samples.length, SAMPLE_RATE);
-  buffer.getChannelData(0).set(samples);
+function connectWebSocket() {
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url = `${protocol}//${location.host}`;
 
-  const source = audioCtx.createBufferSource();
-  source.buffer = buffer;
-  source.connect(audioCtx.destination);
+  ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
 
-  return new Promise((resolve) => {
-    source.onended = resolve;
-    source.start();
-  });
+  ws.onopen = async () => {
+    wsConnected = true;
+    elWsStatus.textContent = 'WS:OK';
+
+    // Create a small avatar data URL for relay to other clients
+    let avatarSmall = null;
+    if (selfieBlob) {
+      try {
+        const bmp = await createImageBitmap(selfieBlob);
+        const c = document.createElement('canvas');
+        c.width = 64; c.height = 64;
+        const cx = c.getContext('2d');
+        const s = Math.min(bmp.width, bmp.height);
+        cx.drawImage(bmp, (bmp.width - s) / 2, (bmp.height - s) / 2, s, s, 0, 0, 64, 64);
+        bmp.close();
+        avatarSmall = c.toDataURL('image/jpeg', 0.5);
+      } catch (e) {}
+    }
+
+    // Register with name + dossier + avatar
+    const registration = {
+      terminal: terminalId,
+      name: displayName,
+      language: getLang(),
+      consentData,
+      avatar: avatarSmall,
+      fingerprint: fingerprint || {},
+      behavior: behavior.getSummary(),
+    };
+    ws.send(JSON.stringify(registration));
+    knownNames[terminalId] = displayName;
+
+    // Send selfie as face snapshot
+    if (selfieBlob) {
+      selfieBlob.arrayBuffer().then(buf => {
+        sendFaceSnapshot(new Uint8Array(buf));
+      });
+    }
+  };
+
+  ws.onclose = () => {
+    wsConnected = false;
+    elWsStatus.textContent = 'WS:--';
+    elWsStatus.className = '';
+    // Reconnect after 2 seconds
+    setTimeout(connectWebSocket, 2000);
+  };
+
+  ws.onerror = () => {
+    wsConnected = false;
+  };
+
+  ws.onmessage = (event) => {
+    if (event.data instanceof ArrayBuffer) {
+      // Binary: selfie relay
+      const bytes = new Uint8Array(event.data);
+      if (bytes[0] === MSG_FACE_SNAP) {
+        const sourceId = bytes[1];
+        const jpegBytes = bytes.subarray(2);
+        const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
+        knownAvatars[sourceId] = URL.createObjectURL(blob);
+      }
+    } else if (typeof event.data === 'string') {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'name' && msg.terminal && msg.name) {
+          knownNames[msg.terminal] = msg.name;
+          if (msg.avatar) knownAvatars[msg.terminal] = msg.avatar;
+        } else if (msg.type === 'message') {
+          handleIncomingMessage(msg);
+        }
+      } catch (e) {}
+    }
+  };
+}
+
+/**
+ * Send encoded audio to the relay server.
+ * Format: byte 0 = MSG_AUDIO, byte 1 = terminal ID, rest = Float32 audio.
+ */
+function sendAudio(samples) {
+  if (!ws || !wsConnected) return;
+
+  const audioBytes = new Uint8Array(samples.buffer);
+  const packet = new Uint8Array(2 + audioBytes.length);
+  packet[0] = MSG_AUDIO;
+  packet[1] = terminalId;
+  packet.set(audioBytes, 2);
+
+  ws.send(packet.buffer);
+}
+
+/**
+ * Send the selfie portrait to the operator.
+ */
+function sendFaceSnapshot(jpegBytes) {
+  if (!ws || !wsConnected) return;
+
+  const packet = new Uint8Array(2 + jpegBytes.length);
+  packet[0] = MSG_FACE_SNAP;
+  packet[1] = terminalId;
+  packet.set(jpegBytes, 2);
+  ws.send(packet.buffer);
+}
+
+/**
+ * Handle incoming text message from the relay server.
+ * Generates ornamental Silbo audio and plays it while typing text.
+ */
+function handleIncomingMessage(incoming) {
+  const { terminal: sourceId, name: senderName, text, avatar: incomingAvatar } = incoming;
+
+  // Store their avatar if we don't have it
+  if (incomingAvatar && !knownAvatars[sourceId]) {
+    knownAvatars[sourceId] = incomingAvatar;
+  }
+
+  // Generate Silbo audio with this sender's unique waveform
+  const waveform = getWaveform(sourceId);
+  const { samples: silboAudio, durationMs } = synthesizeSilbo(text, waveform);
+
+  // Add chat message with waveform and avatar
+  const msg = addChatMessage(
+    senderName || knownNames[sourceId] || `TF${sourceId}`,
+    false, silboAudio, sourceId
+  );
+
+  // Play the Silbo whistle (simultaneous — the cacophony)
+  playSilboAsync(audioCtx, silboAudio);
+
+  glitch.setIntensity(0.7);
+  setStatus('RECEIVING');
+
+  // Animate text typing out in sync with audio
+  const msPerChar = durationMs / Math.max(1, text.length);
+  msg.animateText(text, msPerChar);
+
+  setTimeout(() => {
+    glitch.setIntensity(0);
+    setStatus('ONLINE');
+  }, durationMs);
 }
 
 // ---- Transmit ----
@@ -273,197 +662,54 @@ async function transmitMessage(text) {
   setStatus('TRANSMITTING');
   elInput.disabled = true;
 
-  addMessage(text, terminalId, 1, true);
-
-  // Ramp up glitch visuals during transmission
+  const trimmed = text.slice(0, MAX_MESSAGE_LENGTH);
+  behavior.recordMessage(trimmed);
   glitch.setIntensity(0.9);
 
-  // Digital loopback test
-  const loopback = loopbackTest(text, terminalId);
-  if (loopback) {
-    addSystemMessage(`[loopback] "${loopback.text}" (${Math.round(loopback.confidence * 100)}%) checksum:${loopback.text === text ? 'OK' : 'FAIL'}`);
-  } else {
-    addSystemMessage('[loopback] decode failed');
+  // Generate ornamental Silbo audio from text
+  const waveform = getWaveform(terminalId);
+  const { samples: silboAudio, durationMs } = synthesizeSilbo(trimmed, waveform);
+
+  // Add to our chat with waveform — animate text in sync with audio
+  const msg = addChatMessage(displayName, true, silboAudio, terminalId);
+  const msPerChar = durationMs / Math.max(1, trimmed.length);
+  msg.animateText(trimmed, msPerChar);
+
+  // Play Silbo whistle locally
+  const playPromise = playSilbo(audioCtx, silboAudio);
+
+  // Send text message to server
+  if (ws && wsConnected) {
+    ws.send(JSON.stringify({
+      type: 'message',
+      terminal: terminalId,
+      name: displayName,
+      text: trimmed,
+    }));
   }
 
-  // Encode and play the modem audio
-  const modemAudio = encodeMessage(text, terminalId);
-  await playAudio(modemAudio);
+  await playPromise;
 
-  // Post-transmit cooldown
-  await sleep(500);
-  clearRecentAudio(MIC_BUFFER_SECONDS);
-
-  // Ramp down glitch
   glitch.setIntensity(0);
-
   isTransmitting = false;
   elInput.disabled = false;
   elInput.focus();
-  setStatus(isListening ? 'ONLINE' : 'OFFLINE');
+  setStatus('ONLINE');
 }
 
-// ---- Receive / Decode ----
-
-let decodeInterval = null;
-
-function startDecoding() {
-  isListening = true;
-
-  decodeInterval = setInterval(() => {
-    if (isTransmitting) return;
-
-    for (const tid of listenTo) {
-      if (tid === terminalId) continue;
-
-      const recentAudio = getRecentAudio(2.0);
-      if (recentAudio.length === 0) continue;
-
-      if (!detectCarrier(recentAudio, tid)) continue;
-
-      // Carrier detected — grab full buffer and decode
-      setStatus('RECEIVING');
-      glitch.setIntensity(0.6);
-
-      const fullAudio = getRecentAudio(MIC_BUFFER_SECONDS);
-      const result = decodeMessage(fullAudio, tid);
-
-      if (result && result.text.length > 0) {
-        addMessageAnimated(result.text, result.source, result.confidence);
-
-        if (printer && printer.connected) {
-          printer.printMessage(result.text, result.source, result.confidence);
-        }
-
-        clearRecentAudio(MIC_BUFFER_SECONDS);
-      }
-
-      glitch.setIntensity(0);
-      setStatus('ONLINE');
-    }
-  }, 500);
-}
-
-function stopDecoding() {
-  isListening = false;
-  if (decodeInterval) {
-    clearInterval(decodeInterval);
-    decodeInterval = null;
-  }
-}
-
-function getRecentAudio(seconds) {
-  if (!micBuffer) return new Float32Array(0);
-  const samples = Math.min(Math.floor(seconds * SAMPLE_RATE), micBuffer.length);
-  const output = new Float32Array(samples);
-  for (let i = 0; i < samples; i++) {
-    const idx = (micBufferWritePos - samples + i + micBuffer.length) % micBuffer.length;
-    output[i] = micBuffer[idx];
-  }
-  return output;
-}
-
-function clearRecentAudio(seconds) {
-  const samples = Math.min(Math.floor(seconds * SAMPLE_RATE), micBuffer.length);
-  for (let i = 0; i < samples; i++) {
-    const idx = (micBufferWritePos - samples + i + micBuffer.length) % micBuffer.length;
-    micBuffer[idx] = 0;
-  }
-}
-
-// ---- Spectrogram ----
-
-let spectrogramAnimFrame = null;
-
-function startSpectrogram() {
-  const width = elSpectrogram.width;
-  const height = elSpectrogram.height;
-  const freqData = new Uint8Array(analyserNode.frequencyBinCount);
-
-  function draw() {
-    analyserNode.getByteFrequencyData(freqData);
-
-    const imageData = spectrogramCtx.getImageData(1, 0, width - 1, height);
-    spectrogramCtx.putImageData(imageData, 0, 0);
-
-    // Show 0-4000 Hz (where our modem signals live)
-    const maxBin = Math.floor((4000 / (SAMPLE_RATE / 2)) * freqData.length);
-
-    for (let y = 0; y < height; y++) {
-      const binIdx = Math.floor((1 - y / height) * maxBin);
-      const value = freqData[binIdx] || 0;
-      const brightness = Math.floor(value * 0.7);
-      spectrogramCtx.fillStyle = `rgb(${brightness},${brightness},${brightness})`;
-      spectrogramCtx.fillRect(width - 1, y, 1, 1);
-    }
-
-    // Draw frequency markers for our terminal's mark/space
-    const freqs = getFreqs(terminalId);
-    for (const f of [freqs.mark, freqs.space]) {
-      const y = height - (f / 4000) * height;
-      spectrogramCtx.fillStyle = 'rgba(100,100,100,0.6)';
-      spectrogramCtx.fillRect(width - 1, Math.floor(y), 1, 1);
-    }
-
-    spectrogramAnimFrame = requestAnimationFrame(draw);
-  }
-
-  draw();
-}
-
-// ---- Printer ----
-
-async function connectPrinter() {
-  printer = new ThermalPrinter();
-  try {
-    await printer.connect();
-    elPrinterStatus.textContent = `CONNECTED (${printer.mode})`;
-    await printer.printStatus(`SILBO TERMINAL ${String(terminalId).padStart(2, '0')} ONLINE`);
-    addSystemMessage(`Printer connected via ${printer.mode}`);
-  } catch (e) {
-    elPrinterStatus.textContent = 'FAILED';
-    addSystemMessage(`Printer: ${e.message}`);
-    printer = null;
-  }
-}
-
-// ---- Start / Stop ----
+// ---- Start ----
 
 async function startTerminal() {
   try {
-    addSystemMessage('Initializing audio...');
     await initAudio();
-
-    terminalId = parseInt(elInputTerminalId.value, 10) || 1;
-    listenTo = getListenTargets();
     updateHeader();
-
-    const freqs = getFreqs(terminalId);
-    addSystemMessage(`Modem: mark=${freqs.mark}Hz space=${freqs.space}Hz @ ${BAUD_RATE} baud`);
-    addSystemMessage(`Listening for: ${listenTo.filter(t => t !== terminalId).join(', ') || 'none'}`);
-
-    startDecoding();
-    startSpectrogram();
-
-    elConfigPanel.classList.add('hidden');
+    connectWebSocket();
     setStatus('ONLINE');
     elInput.focus();
-
-    addSystemMessage('Terminal online. Type a message and press Enter.');
-
-    if (printer && printer.connected) {
-      await printer.printStatus('LISTENING');
-    }
   } catch (e) {
     addSystemMessage(`Error: ${e.message}`);
     console.error(e);
   }
-}
-
-// ---- Util ----
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 // ---- Init ----
