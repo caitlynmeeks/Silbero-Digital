@@ -122,9 +122,9 @@ export async function captureSelfie(guideImageUrl) {
     let capturedBlob = null;
     let capturedDataUrl = null;
 
-    // Start camera
+    // Start camera at higher resolution for reliable server-side face detection
     navigator.mediaDevices.getUserMedia({
-      video: { facingMode: 'user', width: { ideal: 480 }, height: { ideal: 360 } },
+      video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 960 } },
       audio: false,
     }).then(s => {
       stream = s;
@@ -137,8 +137,8 @@ export async function captureSelfie(guideImageUrl) {
     });
 
     btnCapture.addEventListener('click', () => {
-      canvas.width = video.videoWidth || 480;
-      canvas.height = video.videoHeight || 360;
+      canvas.width = video.videoWidth || 1280;
+      canvas.height = video.videoHeight || 960;
       const ctx = canvas.getContext('2d');
       // Mirror the image (front camera is mirrored)
       ctx.translate(canvas.width, 0);
@@ -154,7 +154,7 @@ export async function captureSelfie(guideImageUrl) {
         btnCapture.style.display = 'none';
         btnRetake.style.display = 'block';
         btnAccept.style.display = 'block';
-      }, 'image/jpeg', 0.85);
+      }, 'image/jpeg', 0.92);
     });
 
     btnRetake.addEventListener('click', () => {

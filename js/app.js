@@ -18,6 +18,7 @@ import {
 import { GlitchRenderer } from './glitch.js';
 import { ThermalPrinter } from './thermal-printer.js';
 import { captureSelfie } from './camera.js';
+import { annotateWithFaceDetection } from './face-detect.js';
 import { collectFingerprint, TypingBiometrics, BehaviorTracker, estimateHandedness } from './fingerprint.js';
 import { setLanguage, t, getLang } from './i18n.js';
 
@@ -38,8 +39,10 @@ let consentPrivacy = false;
 let userName = '';
 let userTag = '';
 let displayName = '';
-let selfieBlob = null;
+let selfieBlob = null;     // annotated (for local display/avatars)
+let selfieRawBlob = null;  // raw (sent to server for ML analysis)
 let selfieDataUrl = null;
+let selfieDetections = null;
 let fingerprint = null;
 const typing = new TypingBiometrics();
 const behavior = new BehaviorTracker();
@@ -158,8 +161,13 @@ function initUI() {
     if (consentData) {
       const result = await captureSelfie('images/whistler4.jpg');
       if (result) {
-        selfieBlob = result.blob;
-        selfieDataUrl = result.dataUrl;
+        // Keep raw selfie for server-side ML analysis (no overlays)
+        selfieRawBlob = result.blob;
+        // Run face detection and annotate with targeting overlay for local display
+        const annotated = await annotateWithFaceDetection(result.blob);
+        selfieBlob = annotated.blob;
+        selfieDataUrl = annotated.dataUrl;
+        selfieDetections = annotated.detections;
       }
     }
 
@@ -181,11 +189,10 @@ function initUI() {
       } catch (e) {}
     }
 
-    // Collect device fingerprint and display it to the user
+    // Collect device fingerprint (sent to server with registration, not displayed to user)
     collectFingerprint().then(fp => {
       fp.handedness = handedness;
       fingerprint = fp;
-      displayFingerprint(fp);
     });
 
     await startTerminal();
@@ -231,52 +238,55 @@ function setStatus(status) {
   else if (status === 'TRANSMITTING') elStatus.classList.add('transmitting');
 }
 
-// ---- Data Panel (surveillance made visible) ----
-
-function displayFingerprint(fp) {
-  const panel = document.getElementById('data-panel');
-  if (!panel) return;
-
-  const rows = [
-    ['NAME', displayName],
-    ['ID', userTag],
-    ['LANG', getLang()?.toUpperCase()],
-    ['IP', fp.ip],
-    ['CITY', [fp.city, fp.region, fp.countryCode].filter(Boolean).join(', ')],
-    ['ISP', fp.isp],
-    ['COORDS', fp.latitude && fp.longitude ? `${fp.latitude}, ${fp.longitude}` : null],
-    ['DEVICE', fp.userAgent?.match(/\(([^)]+)\)/)?.[1]],
-    ['SCREEN', fp.screenWidth && `${fp.screenWidth}x${fp.screenHeight} @${fp.pixelRatio}x`],
-    ['GPU', fp.gpuRenderer],
-    ['CPU', fp.hardwareConcurrency && `${fp.hardwareConcurrency} cores`],
-    ['RAM', fp.deviceMemory && `${fp.deviceMemory} GB`],
-    ['BATTERY', fp.batteryLevel !== undefined ? `${fp.batteryLevel}% ${fp.batteryCharging ? 'CHG' : 'DIS'}` : null],
-    ['NET', [fp.connectionType, fp.downlink && `${fp.downlink}Mbps`].filter(Boolean).join(' ')],
-    ['TZ', fp.timezoneIANA],
-    ['LANGS', fp.languages?.join(', ')],
-    ['DARK', fp.darkMode ? 'YES' : 'NO'],
-    ['DNT', fp.doNotTrack ? 'ENABLED' : 'OFF'],
-    ['HAND', fp.handedness],
-    ['MAC', fp.macAddress],
-    ['CANVAS', fp.canvasFingerprint?.slice(0, 12) + '...'],
-    ['AUDIO', fp.audioFingerprint?.slice(0, 12) + '...'],
-    ['DEVICE#', fp.deviceHash?.slice(0, 12) + '...'],
-    ['FONTS', fp.installedFonts?.length && `${fp.installedFonts.length} detected`],
-  ];
-
-  panel.innerHTML = rows
-    .filter(([, v]) => v)
-    .map(([label, value]) =>
-      `<div class="data-row"><span class="data-label">${label}:</span> <span class="data-value">${value}</span></div>`
-    )
-    .join('');
-}
 
 // ---- IRC Chat ----
 
 // Map of known terminal IDs to display names and avatars
 const knownNames = {};
 const knownAvatars = {};  // terminalId -> data URL of selfie
+
+// Avatar tracking — every chat message references its avatar column so
+// we can update them all together when a user transmits / mark elapsed time.
+const avatarsByTerminal = {};   // terminalId -> Array of avatar column DOM elements
+const lastTransmitTime = {};    // terminalId -> Date.now() of last transmission
+
+function registerAvatar(terminalId, avatarCol) {
+  if (!avatarsByTerminal[terminalId]) avatarsByTerminal[terminalId] = [];
+  avatarsByTerminal[terminalId].push(avatarCol);
+}
+
+function setTransmitting(terminalId, on) {
+  const cols = avatarsByTerminal[terminalId] || [];
+  for (const col of cols) col.classList.toggle('transmitting', on);
+}
+
+function markTransmission(terminalId) {
+  lastTransmitTime[terminalId] = Date.now();
+}
+
+function formatElapsed(secs) {
+  if (secs < 60) return `${secs}s`;
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  if (m < 60) return `${m}m${s.toString().padStart(2, '0')}`;
+  const h = Math.floor(m / 60);
+  return `${h}h${(m % 60).toString().padStart(2, '0')}`;
+}
+
+function updateAllTimers() {
+  const now = Date.now();
+  for (const [tid, cols] of Object.entries(avatarsByTerminal)) {
+    const last = lastTransmitTime[tid];
+    if (!last) continue;
+    const display = formatElapsed(Math.floor((now - last) / 1000));
+    for (const col of cols) {
+      const timer = col.querySelector('.chat-msg-timer');
+      if (timer) timer.textContent = display;
+    }
+  }
+}
+
+setInterval(updateAllTimers, 1000);
 
 function timeStamp() {
   return new Date().toTimeString().slice(0, 8);
@@ -298,13 +308,34 @@ function addChatMessage(name, isSelf, samples, sourceId) {
   const wrapper = document.createElement('div');
   wrapper.className = 'chat-msg-wrapper';
 
-  // Avatar
+  // Avatar column: image + timer overlay + name label
+  const avatarCol = document.createElement('div');
+  avatarCol.className = 'chat-msg-avatar-col';
+  avatarCol.dataset.terminal = sourceId;
+
   const avatar = document.createElement('div');
   avatar.className = 'chat-msg-avatar';
   const avatarUrl = isSelf ? selfieDataUrl : knownAvatars[sourceId];
   if (avatarUrl) {
     avatar.style.backgroundImage = `url(${avatarUrl})`;
   }
+
+  // Timer overlay (top-right of image)
+  const timerEl = document.createElement('div');
+  timerEl.className = 'chat-msg-timer';
+  timerEl.textContent = '0s';
+  avatar.appendChild(timerEl);
+
+  // Name label below image
+  const nameLabel = document.createElement('div');
+  nameLabel.className = 'chat-msg-name-label';
+  nameLabel.textContent = name;
+
+  avatarCol.appendChild(avatar);
+  avatarCol.appendChild(nameLabel);
+
+  // Register so future updates touch all of this user's avatars
+  registerAvatar(sourceId, avatarCol);
 
   // Content column
   const content = document.createElement('div');
@@ -343,7 +374,7 @@ function addChatMessage(name, isSelf, samples, sourceId) {
   content.appendChild(waveCanvas);
   content.appendChild(textDiv);
 
-  wrapper.appendChild(avatar);
+  wrapper.appendChild(avatarCol);
   wrapper.appendChild(content);
   msg.appendChild(wrapper);
 
@@ -537,15 +568,16 @@ function connectWebSocket() {
       language: getLang(),
       consentData,
       avatar: avatarSmall,
+      faceDetections: selfieDetections || [],
       fingerprint: fingerprint || {},
       behavior: behavior.getSummary(),
     };
     ws.send(JSON.stringify(registration));
     knownNames[terminalId] = displayName;
 
-    // Send selfie as face snapshot
-    if (selfieBlob) {
-      selfieBlob.arrayBuffer().then(buf => {
+    // Send raw selfie (no overlays) for server-side face analysis
+    if (selfieRawBlob) {
+      selfieRawBlob.arrayBuffer().then(buf => {
         sendFaceSnapshot(new Uint8Array(buf));
       });
     }

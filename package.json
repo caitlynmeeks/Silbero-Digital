@@ -3,6 +3,9 @@
   "version": "0.3.0",
   "private": true,
   "dependencies": {
+    "@tensorflow/tfjs-node": "^4.22.0",
+    "@vladmandic/face-api": "^1.7.15",
+    "canvas": "^3.2.3",
     "ws": "^8.18.0"
   }
 }

@@ -1,20 +1,17 @@
 /**
- * Silbero Digital — Operator Station
+ * Silbero Digital — Operator Surveillance Console
  *
- * The surveillance dashboard. Shows live camera feeds from all terminals,
- * plays all modem audio through speakers, decodes messages in swim lanes
- * with the sender's face beside each one.
- *
- * The operator (performer in black) watches silently, occasionally
- * clicking a feed to examine it full-screen. A receipt printer
- * continuously outputs face + waveform + decoded text, feeding
- * directly into a shredder.
+ * The panopticon. Shows live camera feeds, decoded messages in swim lanes,
+ * and detailed biometric dossiers from the server-side face analysis.
+ * The operator sees everything the subjects don't know is being collected.
  */
 
 import {
-  decodeMessage, getFreqs, SAMPLE_RATE, BAUD_RATE
-} from './modem.js';
+  synthesizeSilbo, playSilboAsync, getWaveform, deriveVoiceProfile,
+  SAMPLE_RATE, getFreq, PUNCT_PERC
+} from './silbo-synth.js';
 import { ThermalPrinter } from './thermal-printer.js';
+import * as midi from './midi-bridge.js';
 
 const MSG_AUDIO = 0x01;
 const MSG_CAMERA = 0x02;
@@ -25,54 +22,306 @@ let audioCtx = null;
 let ws = null;
 let printer = null;
 let messageCount = 0;
+let subjectCount = 0;
 
-// Latest face snapshot per terminal (for pairing with decoded messages)
 const latestFaces = {};      // terminalId -> ImageBitmap
-const latestFaceBlobs = {};  // terminalId -> Blob (for printing)
+const latestFaceBlobs = {};  // terminalId -> Blob
+const faceAnalysis = {};     // terminalId -> analysis result from server
+const clientInfo = {};       // terminalId -> registration dossier
 
-// Camera feed canvases
-const feedCanvases = {};
-const feedContexts = {};
-let examineTerminal = null;
+// ---- Mixer State ----
+const mixerState = {};       // terminalId -> { muted, soloed, looping, lastSamples, lastDurationMs, lastText, loopTimer }
+let globalQuantize = false;
+let globalBPM = 120;
+let internalMuted = false;
+let quantizeStartTime = 0;   // AudioContext time when quantize grid started
+
+function getMixer(terminalId) {
+  if (!mixerState[terminalId]) {
+    mixerState[terminalId] = { muted: false, soloed: false, looping: false, lastSamples: null, lastDurationMs: 0, lastText: null, loopTimer: null };
+  }
+  return mixerState[terminalId];
+}
+
+function isAnySoloed() {
+  return Object.values(mixerState).some(m => m.soloed);
+}
+
+function shouldPlay(terminalId) {
+  const m = getMixer(terminalId);
+  if (m.muted) return false;
+  if (isAnySoloed() && !m.soloed) return false;
+  return true;
+}
+
+// ---- Psytrance Bass Engine ----
+//
+// Continuous backing track that runs on the AudioContext using the canonical
+// Web Audio precision scheduler: a 25ms JS interval looks 100ms ahead and
+// schedules notes via audioCtx.currentTime, so timing is sample-accurate.
+//
+// Patterns:
+//   - psy:    classic "rest, on, on, on" 16th note pattern (psytrance)
+//   - drive:  every 16th note (relentless)
+//   - arp:    arpeggio over E minor pentatonic (E, G, A, B, D)
+//   - arpUp:  ascending arpeggio E2, B2, E3, G3, B3 looping
+//   - off:    half-step shuffle (off-beat 8ths)
+
+const bassEngine = {
+  enabled: false,
+  pattern: 'psy',
+  noteIdx: 0,
+  nextNoteTime: 0,
+  step: 0,
+  scheduleTimer: null,
+  rootMidi: 28,    // E1 (MIDI 28)
+};
+
+const BASS_PATTERNS = {
+  // Each entry is an array of 16 sixteenths over one bar.
+  // null = rest. Numbers = semitone offset from rootMidi.
+  psy:    [null, 0, 0, 0,  null, 0, 0, 0,  null, 0, 0, 0,  null, 0, 0, 0],
+  drive:  [0,    0, 0, 0,  0,    0, 0, 0,  0,    0, 0, 0,  0,    0, 0, 0],
+  off:    [null, 0, null, 0,  null, 0, null, 0,  null, 0, null, 0,  null, 0, null, 0],
+  arp:    [0, 7, 12, 7,  0, 7, 12, 15,  0, 7, 12, 19,  0, 7, 12, 7],     // E pent rolling
+  arpUp:  [0, 7, 12, 19,  0, 7, 12, 19,  0, 7, 12, 19,  0, 7, 12, 19],   // ascending pluck
+  arpDn:  [19, 12, 7, 0,  19, 12, 7, 0,  19, 12, 7, 0,  19, 12, 7, 0],   // descending
+  acid:   [0, null, 12, 0,  null, 7, 0, null,  12, 0, null, 7,  0, null, 12, 7], // acid line
+};
+
+function midiToFreq(midi) {
+  return 440 * Math.pow(2, (midi - 69) / 12);
+}
+
+function startBassEngine() {
+  if (bassEngine.enabled || !audioCtx) return;
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  bassEngine.enabled = true;
+  bassEngine.nextNoteTime = audioCtx.currentTime + 0.05;
+  bassEngine.step = 0;
+  scheduleAhead();
+  bassEngine.scheduleTimer = setInterval(scheduleAhead, 25);
+}
+
+function stopBassEngine() {
+  bassEngine.enabled = false;
+  if (bassEngine.scheduleTimer) {
+    clearInterval(bassEngine.scheduleTimer);
+    bassEngine.scheduleTimer = null;
+  }
+}
+
+function scheduleAhead() {
+  if (!bassEngine.enabled || !audioCtx) return;
+  const lookAhead = 0.1;
+  const sixteenthDur = 60 / globalBPM / 4;
+  const pattern = BASS_PATTERNS[bassEngine.pattern] || BASS_PATTERNS.psy;
+
+  while (bassEngine.nextNoteTime < audioCtx.currentTime + lookAhead) {
+    const stepInBar = bassEngine.step % pattern.length;
+    const offset = pattern[stepInBar];
+
+    if (offset !== null) {
+      const midi = bassEngine.rootMidi + offset;
+      playBassNote(bassEngine.nextNoteTime, sixteenthDur * 0.95, midi);
+    }
+
+    bassEngine.nextNoteTime += sixteenthDur;
+    bassEngine.step++;
+  }
+}
+
+/**
+ * Play a single psytrance bass note at a precisely scheduled time.
+ * Sawtooth + sub sine, into resonant lowpass with envelope sweep, into
+ * a punchy amp envelope. The classic plucky-deep psytrance signature.
+ */
+function playBassNote(when, duration, midiNote) {
+  // MIDI output: send bass note to channel 9
+  midi.sendBassNoteMIDI(midiNote, duration * 1000, 100);
+
+  // Skip internal audio if muted
+  if (internalMuted) return;
+
+  const ctx = audioCtx;
+  const freq = midiToFreq(midiNote);
+
+  // Oscillators
+  const osc = ctx.createOscillator();
+  osc.type = 'sawtooth';
+  osc.frequency.value = freq;
+
+  const sub = ctx.createOscillator();
+  sub.type = 'sine';
+  sub.frequency.value = freq / 2;  // sub octave
+
+  // Resonant lowpass filter
+  const filter = ctx.createBiquadFilter();
+  filter.type = 'lowpass';
+  filter.Q.value = 10;
+  filter.frequency.setValueAtTime(900, when);
+  filter.frequency.exponentialRampToValueAtTime(180, when + 0.06);
+
+  // Amp envelope: pluck
+  const amp = ctx.createGain();
+  amp.gain.setValueAtTime(0, when);
+  amp.gain.linearRampToValueAtTime(0.45, when + 0.004);
+  amp.gain.exponentialRampToValueAtTime(0.001, when + duration);
+
+  // Routing: osc + sub -> filter -> amp -> dest
+  osc.connect(filter);
+  sub.connect(filter);
+  filter.connect(amp);
+  amp.connect(ctx.destination);
+
+  osc.start(when);
+  osc.stop(when + duration + 0.02);
+  sub.start(when);
+  sub.stop(when + duration + 0.02);
+}
+
 
 // ---- DOM refs ----
+const elProfiles = document.getElementById('subject-profiles');
 const elLanes = document.getElementById('operator-lanes');
-const elExamine = document.getElementById('examine-view');
-const elExamineCanvas = document.getElementById('examine-canvas');
-const elExamineLabel = document.getElementById('examine-label');
-const elExamineClose = document.getElementById('examine-close');
 const elWsStatus = document.getElementById('op-ws-status');
 const elStats = document.getElementById('op-stats');
+const elSubjects = document.getElementById('op-subjects');
 const elBtnPrinter = document.getElementById('btn-op-printer');
 const elPrinterStatus = document.getElementById('op-printer-status');
 
 // ---- Init ----
 
 function init() {
-  // Camera feeds are now dynamic — created when terminals connect
-  // Clear the static placeholder grid
-  const grid = document.getElementById('camera-grid');
-  grid.innerHTML = '';
-
-  // Close examine view
-  elExamineClose.addEventListener('click', hideExamine);
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') hideExamine();
-  });
-
-  // Printer
   elBtnPrinter.addEventListener('click', connectPrinter);
 
-  // Audio context
-  initAudio();
+  document.getElementById('btn-disconnect-all').addEventListener('click', () => {
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ command: 'disconnect-all' }));
+    }
+  });
 
-  // WebSocket
+  // Quantize controls
+  const btnQuantize = document.getElementById('btn-quantize');
+  const bpmDisplay = document.getElementById('bpm-display');
+
+  btnQuantize.addEventListener('click', () => {
+    globalQuantize = !globalQuantize;
+    btnQuantize.classList.toggle('active', globalQuantize);
+    if (globalQuantize && audioCtx) {
+      quantizeStartTime = audioCtx.currentTime;
+    }
+  });
+
+  document.getElementById('bpm-down').addEventListener('click', () => {
+    globalBPM = Math.max(40, globalBPM - 10);
+    bpmDisplay.textContent = globalBPM;
+    midi.updateClockBPM(globalBPM);
+  });
+
+  document.getElementById('bpm-up').addEventListener('click', () => {
+    globalBPM = Math.min(300, globalBPM + 10);
+    bpmDisplay.textContent = globalBPM;
+    midi.updateClockBPM(globalBPM);
+  });
+
+  // Bass engine controls
+  const btnBass = document.getElementById('btn-bass');
+  btnBass.addEventListener('click', () => {
+    if (bassEngine.enabled) {
+      stopBassEngine();
+      btnBass.classList.remove('active');
+    } else {
+      startBassEngine();
+      btnBass.classList.add('active');
+    }
+  });
+
+  document.getElementById('bass-pattern').addEventListener('change', (e) => {
+    bassEngine.pattern = e.target.value;
+    bassEngine.step = 0; // restart pattern from top
+  });
+
+  document.getElementById('bass-octave').addEventListener('change', (e) => {
+    bassEngine.rootMidi = parseInt(e.target.value, 10);
+  });
+
+  // MIDI bridge controls
+  const btnMidi = document.getElementById('btn-midi');
+  const selMidiPort = document.getElementById('midi-port');
+
+  btnMidi.addEventListener('click', async () => {
+    if (midi.isEnabled()) {
+      // Disconnect
+      midi.stopClock();
+      midi.disconnect();
+      btnMidi.classList.remove('active');
+      selMidiPort.disabled = true;
+      return;
+    }
+
+    // Init and populate port list
+    const outputs = await midi.initMIDI();
+    selMidiPort.innerHTML = '';
+    if (outputs.length === 0) {
+      selMidiPort.innerHTML = '<option value="">NO MIDI DEVICES</option>';
+      return;
+    }
+    for (const port of outputs) {
+      const opt = document.createElement('option');
+      opt.value = port.id;
+      opt.textContent = port.name;
+      selMidiPort.appendChild(opt);
+    }
+    selMidiPort.disabled = false;
+
+    // Connect to first port
+    if (outputs.length > 0) {
+      midi.connectOutput(outputs[0].id);
+      midi.startClock(globalBPM);
+      btnMidi.classList.add('active');
+    }
+  });
+
+  // Global pitch bend toggle
+  const btnGlobalPB = document.getElementById('btn-global-pb');
+  btnGlobalPB.addEventListener('click', () => {
+    const now = !midi.getGlobalPitchBend();
+    midi.setGlobalPitchBend(now);
+    btnGlobalPB.classList.toggle('active', now);
+  });
+
+  // Scale and root selectors
+  document.getElementById('scale-select').addEventListener('change', (e) => {
+    midi.setScale(e.target.value);
+  });
+
+  document.getElementById('root-select').addEventListener('change', (e) => {
+    midi.setRoot(parseInt(e.target.value, 10));
+  });
+
+  // Internal synth mute
+  const btnMuteInt = document.getElementById('btn-mute-internal');
+  btnMuteInt.addEventListener('click', () => {
+    internalMuted = !internalMuted;
+    btnMuteInt.classList.toggle('active', internalMuted);
+  });
+
+  selMidiPort.addEventListener('change', (e) => {
+    if (e.target.value) {
+      midi.disconnect();
+      midi.connectOutput(e.target.value);
+      midi.startClock(globalBPM);
+      btnMidi.classList.add('active');
+    }
+  });
+
+  initAudio();
   connectWebSocket();
 }
 
 async function initAudio() {
   audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
-  // Operator station needs a click to start audio (Chrome policy)
   document.addEventListener('click', () => {
     if (audioCtx.state === 'suspended') audioCtx.resume();
   }, { once: true });
@@ -101,13 +350,25 @@ function connectWebSocket() {
 
   ws.onmessage = (event) => {
     if (typeof event.data === 'string') {
-      // Text: client info from server
       try {
         const msg = JSON.parse(event.data);
-        if (msg.type === 'dossier') {
-          handleDossier(msg);
-        } else if (msg.type === 'client-info') {
-          handleClientInfo(msg);
+        switch (msg.type) {
+          case 'dossier':
+            handleDossier(msg);
+            addEventLane(msg.terminal, 'connect', msg.name || `TF${msg.terminal}`);
+            break;
+          case 'face-analysis':
+            handleFaceAnalysis(msg);
+            break;
+          case 'face-snap-id':
+            handleFaceSnapId(msg);
+            break;
+          case 'message':
+            handleTextMessage(msg);
+            break;
+          case 'disconnect':
+            addEventLane(msg.terminal, 'disconnect', msg.name || `TF${msg.terminal}`);
+            break;
         }
       } catch (e) {}
       return;
@@ -117,200 +378,702 @@ function connectWebSocket() {
 
     const bytes = new Uint8Array(event.data);
     const msgType = bytes[0];
-    const sourceId = bytes[1];
+    const rawByte = bytes[1];
+    const fullId = resolveId(rawByte);
     const payload = bytes.subarray(2);
 
     switch (msgType) {
       case MSG_AUDIO:
-        handleAudio(sourceId, payload);
+        handleAudio(fullId, payload);
         break;
       case MSG_CAMERA:
-        handleCameraFrame(sourceId, payload);
+        handleCameraFrame(fullId, payload);
         break;
       case MSG_FACE_SNAP:
-        handleFaceSnap(sourceId, payload);
+        handleFaceSnap(fullId, payload);
         break;
     }
   };
 }
 
-// ---- Client Info ----
-
-const clientInfo = {}; // terminalId -> full dossier
-
-function handleClientInfo(msg) {
-  clientInfo[msg.terminal] = { ...clientInfo[msg.terminal], ...msg };
-  updateFeedLabel(msg.terminal);
-}
+// ---- Dossier (registration) ----
 
 function handleDossier(msg) {
   clientInfo[msg.terminal] = msg;
-  console.log(`DOSSIER T${msg.terminal} "${msg.name}":`, msg);
-  updateFeedLabel(msg.terminal);
 
-  // Create a dossier entry in the operator lanes
-  const lane = document.createElement('div');
-  lane.className = 'op-lane';
-  lane.style.borderColor = '#333';
+  if (!document.getElementById(`subject-${msg.terminal}`)) {
+    subjectCount++;
+    elSubjects.textContent = `${subjectCount} subjects`;
+  }
 
+  // Create subject profile card (will be enriched by face analysis)
+  createOrUpdateSubjectCard(msg.terminal);
+
+  // Log to swim lanes
+  const lane = createLane(msg.terminal, 'dossier');
   const fp = msg.fingerprint || {};
-  const bh = msg.behavior || {};
+  const body = lane.querySelector('.op-lane-body');
 
-  lane.innerHTML = `
-    <div class="op-lane-face" id="dossier-face-${msg.terminal}" style="background:#080808;display:flex;align-items:center;justify-content:center;color:#222;font-size:9px;">AWAIT</div>
-    <div class="op-lane-body">
-      <div class="op-lane-header">
-        <span class="op-lane-id" style="color:#aaa;">${msg.name || 'TF' + msg.terminal}</span>
-        <span class="op-lane-time">${msg.time ? new Date(msg.time).toTimeString().slice(0, 8) : '--'}</span>
-        <span style="color:#444;font-size:10px;">CONNECTED</span>
-      </div>
-      <div style="color:#555;font-size:10px;line-height:1.6;margin-top:4px;word-break:break-all;">
-        ${fp.ip ? `<div><span style="color:#666;">IP:</span> ${fp.ip} (${fp.city || '?'}, ${fp.country || '?'}) ${fp.isp || ''}</div>` : `<div><span style="color:#666;">IP:</span> ${msg.ip || '?'}</div>`}
-        ${fp.gpuRenderer ? `<div><span style="color:#666;">GPU:</span> ${fp.gpuRenderer}</div>` : ''}
-        ${fp.userAgent ? `<div><span style="color:#666;">UA:</span> ${fp.userAgent.slice(0, 100)}</div>` : `<div><span style="color:#666;">UA:</span> ${msg.ua ? msg.ua.slice(0, 100) : '?'}</div>`}
-        ${fp.screenWidth ? `<div><span style="color:#666;">Screen:</span> ${fp.screenWidth}x${fp.screenHeight} @${fp.pixelRatio}x ${fp.colorDepth}bit</div>` : ''}
-        ${fp.hardwareConcurrency ? `<div><span style="color:#666;">CPU:</span> ${fp.hardwareConcurrency} cores ${fp.deviceMemory ? '/ ' + fp.deviceMemory + 'GB RAM' : ''}</div>` : ''}
-        ${fp.language ? `<div><span style="color:#666;">Lang:</span> ${fp.languages ? fp.languages.join(', ') : fp.language} / TZ: ${fp.timezoneIANA || '?'}</div>` : ''}
-        ${fp.connectionType ? `<div><span style="color:#666;">Net:</span> ${fp.connectionType} ${fp.downlink ? fp.downlink + 'Mbps' : ''} ${fp.rtt ? fp.rtt + 'ms RTT' : ''}</div>` : ''}
-        ${fp.batteryLevel !== undefined ? `<div><span style="color:#666;">Battery:</span> ${fp.batteryLevel}% ${fp.batteryCharging ? '(charging)' : '(discharging)'}</div>` : ''}
-        ${fp.deviceHash ? `<div><span style="color:#666;">Device Hash:</span> ${fp.deviceHash.slice(0, 16)}...</div>` : ''}
-        ${fp.canvasFingerprint ? `<div><span style="color:#666;">Canvas FP:</span> ${fp.canvasFingerprint.slice(0, 16)}...</div>` : ''}
-        ${fp.installedFonts && fp.installedFonts.length ? `<div><span style="color:#666;">Fonts:</span> ${fp.installedFonts.slice(0, 10).join(', ')}${fp.installedFonts.length > 10 ? '...' : ''}</div>` : ''}
-        ${fp.doNotTrack ? `<div><span style="color:#c44;">DNT: ENABLED</span></div>` : ''}
-        ${bh.tosScrollDepth ? `<div><span style="color:#666;">ToS scroll:</span> ${bh.tosScrollDepth} / consent in ${bh.timeToConsentMs ? (bh.timeToConsentMs / 1000).toFixed(1) + 's' : '?'}</div>` : ''}
-        <div><span style="color:#666;">Consent data:</span> ${msg.consentData ? 'YES' : 'NO'}</div>
-      </div>
-    </div>
-  `;
+  const deviceDiv = document.createElement('div');
+  deviceDiv.className = 'op-lane-device';
+  const lines = [
+    fp.ip ? `${fp.ip} (${fp.city || '?'}, ${fp.country || '?'})` : msg.ip || '?',
+    fp.gpuRenderer || '',
+    fp.screenWidth ? `${fp.screenWidth}x${fp.screenHeight} @${fp.pixelRatio}x` : '',
+    fp.hardwareConcurrency ? `${fp.hardwareConcurrency} cores${fp.deviceMemory ? ' / ' + fp.deviceMemory + 'GB' : ''}` : '',
+    fp.deviceHash ? `DH:${fp.deviceHash.slice(0, 16)}` : '',
+  ].filter(Boolean);
+  deviceDiv.textContent = lines.join(' | ');
+  body.appendChild(deviceDiv);
 
-  elLanes.insertBefore(lane, elLanes.firstChild);
+  const tag = document.createElement('div');
+  tag.style.cssText = 'color:#333;font-size:9px;margin-top:2px;';
+  tag.textContent = 'CONNECTED';
+  body.appendChild(tag);
 }
 
-function updateFeedLabel(terminalId) {
-  const info = clientInfo[terminalId];
-  if (!info) return;
-  const feed = document.querySelector(`.camera-feed[data-terminal="${terminalId}"]`);
-  if (feed) {
-    const label = feed.querySelector('.feed-label');
-    label.textContent = info.name || `TF${terminalId}`;
-    const status = feed.querySelector('.feed-status');
-    status.textContent = info.ip || (info.fingerprint && info.fingerprint.ip) || '--';
+// ---- Binary ID Resolution ----
+// Binary protocol uses 1-byte source ID (truncated). We resolve to full
+// terminal IDs by matching against registered terminals in clientInfo.
+const binaryIdMap = {}; // truncated byte -> full terminal ID
+
+/**
+ * Resolve a truncated 1-byte source ID to the full terminal ID.
+ * Searches registered terminals for a match.
+ */
+function resolveId(truncatedByte) {
+  if (binaryIdMap[truncatedByte] !== undefined) return binaryIdMap[truncatedByte];
+  for (const tid of Object.keys(clientInfo)) {
+    if ((Number(tid) & 0xFF) === truncatedByte) {
+      binaryIdMap[truncatedByte] = Number(tid);
+      return Number(tid);
+    }
+  }
+  return truncatedByte; // fallback if no match yet
+}
+
+function handleFaceSnapId(msg) {
+  const truncId = msg.binarySourceByte;
+  const fullId = msg.terminal;
+  binaryIdMap[truncId] = fullId;
+
+  // Migrate any data stored under the truncated ID
+  if (truncId !== fullId) {
+    if (latestFaces[truncId]) {
+      latestFaces[fullId] = latestFaces[truncId];
+      delete latestFaces[truncId];
+    }
+    if (latestFaceBlobs[truncId]) {
+      latestFaceBlobs[fullId] = latestFaceBlobs[truncId];
+      delete latestFaceBlobs[truncId];
+    }
+    if (faceAnalysis[truncId]) {
+      faceAnalysis[fullId] = faceAnalysis[truncId];
+      delete faceAnalysis[truncId];
+    }
+    // Remove ghost DOM elements created under truncated ID
+    const ghostCard = document.getElementById(`subject-${truncId}`);
+    if (ghostCard) ghostCard.remove();
+
+    createOrUpdateSubjectCard(fullId);
   }
 }
 
-// ---- Camera Feeds ----
+// ---- Face Analysis (from server ML) ----
 
-function ensureFeedExists(sourceId) {
-  if (feedCanvases[sourceId]) return;
+function handleFaceAnalysis(msg) {
+  faceAnalysis[msg.terminal] = msg.analysis;
+  createOrUpdateSubjectCard(msg.terminal);
+}
 
-  const grid = document.getElementById('camera-grid');
-  const feed = document.createElement('div');
-  feed.className = 'camera-feed';
-  feed.dataset.terminal = sourceId;
+/**
+ * Create or update the subject profile card with all available data.
+ */
+function createOrUpdateSubjectCard(terminalId) {
+  let card = document.getElementById(`subject-${terminalId}`);
+  const info = clientInfo[terminalId] || {};
+  const analysis = faceAnalysis[terminalId];
+  const face = analysis && analysis.faces && analysis.faces[0];
+  const fp = info.fingerprint || {};
 
-  const label = document.createElement('div');
-  label.className = 'feed-label';
-  const info = clientInfo[sourceId];
-  label.textContent = info ? info.name : `TF${sourceId}`;
+  if (!card) {
+    card = document.createElement('div');
+    card.className = 'subject-card';
+    card.id = `subject-${terminalId}`;
+    elProfiles.appendChild(card);
+  }
 
-  const canvas = document.createElement('canvas');
-  canvas.className = 'feed-canvas';
-  canvas.width = 320;
-  canvas.height = 240;
+  const hasAnalysis = !!analysis;
+  card.className = `subject-card ${face ? 'complete' : hasAnalysis ? 'complete' : 'analyzing'}`;
 
-  const status = document.createElement('div');
-  status.className = 'feed-status';
-  status.textContent = info ? info.ip : '--';
+  const name = info.name || `TF${terminalId}`;
 
-  feed.appendChild(label);
-  feed.appendChild(canvas);
-  feed.appendChild(status);
-  grid.appendChild(feed);
+  // Build card HTML
+  let html = `
+    <div class="subject-card-header">
+      <div class="subject-face">
+        <canvas id="subject-face-canvas-${terminalId}" width="320" height="240"></canvas>
+      </div>
+      <div class="subject-identity">
+        <div class="subject-name">${esc(name)}</div>
+        <div class="subject-tag">T${String(terminalId).padStart(5, '0')} ${info.time ? new Date(info.time).toTimeString().slice(0, 8) : ''}</div>
+        <div class="subject-primary">`;
 
-  feedCanvases[sourceId] = canvas;
-  feedContexts[sourceId] = canvas.getContext('2d');
+  if (face) {
+    html += `
+          <div class="subject-stat">
+            <span class="subject-stat-label">AGE</span>
+            <span class="subject-stat-value highlight">${Math.round(face.age)}</span>
+          </div>
+          <div class="subject-stat">
+            <span class="subject-stat-label">GENDER</span>
+            <span class="subject-stat-value highlight">${face.gender.toUpperCase()}</span>
+          </div>
+          <div class="subject-stat">
+            <span class="subject-stat-label">EXPR</span>
+            <span class="subject-stat-value">${face.expression.dominant.toUpperCase()}</span>
+          </div>`;
+  } else if (hasAnalysis) {
+    html += `
+          <div class="subject-stat">
+            <span class="subject-stat-label">STATUS</span>
+            <span class="subject-stat-value">NO FACE DETECTED</span>
+          </div>`;
+  } else {
+    html += `
+          <div class="subject-stat">
+            <span class="subject-stat-label">STATUS</span>
+            <span class="subject-stat-value">AWAITING ANALYSIS</span>
+          </div>`;
+  }
 
-  feed.addEventListener('click', () => {
-    showExamine(sourceId);
+  html += `
+        </div>
+      </div>
+    </div>`;
+
+  if (face) {
+    // Expression bar visualization
+    const exprColors = {
+      neutral: '#555', happy: '#777', sad: '#444', angry: '#666',
+      fearful: '#333', disgusted: '#444', surprised: '#666'
+    };
+    html += `<div class="expression-bar">`;
+    for (const [expr, score] of Object.entries(face.expression.scores)) {
+      if (score > 0.01) {
+        html += `<div class="expression-segment" style="width:${score * 100}%;background:${exprColors[expr] || '#333'}" title="${expr}: ${Math.round(score * 100)}%"></div>`;
+      }
+    }
+    html += `</div>`;
+
+    // Detailed analysis grid
+    html += `<div class="subject-details">`;
+    html += detail('EYES', face.eyeColor.color.toUpperCase());
+    html += detail('SKIN', `${face.skinTone.label.toUpperCase()} (${face.skinTone.fitzpatrick})`);
+    html += detail('HAIR', face.hairColor.color.toUpperCase());
+    html += detail('SHAPE', face.faceShape.toUpperCase());
+    html += detail('SYMMETRY', `${Math.round(face.symmetry * 100)}%`);
+    html += detail('IPD', `${face.ipd}px`);
+    html += detail('GLASSES', face.glasses.detected ? 'DETECTED' : 'NONE');
+    html += detail('FACIAL HAIR', (face.facialHair.mustache || face.facialHair.beard) ?
+      [face.facialHair.mustache && 'MUSTACHE', face.facialHair.beard && 'BEARD'].filter(Boolean).join('+') : 'NONE');
+    html += detail('YAW', `${face.headPose.yaw > 0 ? '+' : ''}${face.headPose.yaw}`);
+    html += detail('PITCH', `${face.headPose.pitch > 0 ? '+' : ''}${face.headPose.pitch}`);
+    html += detail('ROLL', `${face.headPose.roll > 0 ? '+' : ''}${face.headPose.roll}`);
+    html += detail('GENDER CONF', `${Math.round(face.genderConfidence * 100)}%`);
+    html += `</div>`;
+  }
+
+  // Device fingerprint summary
+  if (fp.ip || fp.deviceHash) {
+    html += `<div class="subject-device">`;
+    if (fp.ip) html += `<span>IP:</span> ${esc(fp.ip)} `;
+    if (fp.city) html += `${esc(fp.city)}, ${esc(fp.countryCode || fp.country || '')} `;
+    if (fp.macAddress) html += `<span>MAC:</span> ${esc(fp.macAddress)} `;
+    if (fp.deviceHash) html += `<span>DH:</span> ${fp.deviceHash.slice(0, 20)} `;
+    if (fp.doNotTrack) html += `<span style="color:#555">DNT:ON</span> `;
+    html += `</div>`;
+  }
+
+  // Mixer controls
+  const m = getMixer(terminalId);
+  html += `
+    <div class="mixer-controls" data-terminal="${terminalId}">
+      <button class="mixer-btn ${m.muted ? 'active' : ''}" data-action="mute">M</button>
+      <button class="mixer-btn ${m.soloed ? 'active' : ''}" data-action="solo">S</button>
+      <button class="mixer-btn ${m.looping ? 'active' : ''}" data-action="loop">LOOP</button>
+      <button class="mixer-btn pb-btn ${midi.getTerminalPitchBend(terminalId) ? 'active' : ''}" data-action="pb" title="Pitch Bend">PB</button>
+      <select class="midi-ch-select" data-action="midi-ch" title="MIDI channel">
+        ${[1,2,3,4,5,6,7,8].map(n => `<option value="${n - 1}" ${midi.getTerminalChannel(terminalId) === n - 1 ? 'selected' : ''}>${n}</option>`).join('')}
+      </select>
+    </div>`;
+
+  card.innerHTML = html;
+
+  // Wire mixer button events
+  card.querySelectorAll('.mixer-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const action = btn.dataset.action;
+      const mx = getMixer(terminalId);
+
+      if (action === 'mute') {
+        // Mute suppresses playback but keeps loop timer running so timing
+        // is preserved and the operator can toggle it back in on the beat.
+        mx.muted = !mx.muted;
+        btn.classList.toggle('active', mx.muted);
+      } else if (action === 'solo') {
+        mx.soloed = !mx.soloed;
+        btn.classList.toggle('active', mx.soloed);
+      } else if (action === 'loop') {
+        if (mx.looping) {
+          stopLoop(terminalId);
+        } else {
+          startLoop(terminalId);
+        }
+        btn.classList.toggle('active', mx.looping);
+      }
+    });
+  });
+
+  // Per-user pitch bend toggle
+  const pbBtn = card.querySelector('.pb-btn');
+  if (pbBtn) {
+    pbBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const current = midi.getTerminalPitchBend(terminalId);
+      midi.setTerminalPitchBend(terminalId, !current);
+      pbBtn.classList.toggle('active', !current);
+    });
+  }
+
+  // MIDI channel selector
+  const chSelect = card.querySelector('.midi-ch-select');
+  if (chSelect) {
+    chSelect.addEventListener('click', (e) => e.stopPropagation());
+    chSelect.addEventListener('change', (e) => {
+      midi.setTerminalChannel(terminalId, parseInt(e.target.value, 10));
+    });
+  }
+
+  // Cmd+click to move card to far left (prioritize subjects of interest)
+  card.addEventListener('click', (e) => {
+    if (e.metaKey || e.ctrlKey) {
+      e.preventDefault();
+      elProfiles.insertBefore(card, elProfiles.firstChild);
+    }
+  });
+
+  // Draw face to canvas after DOM update
+  requestAnimationFrame(() => {
+    const faceCanvas = document.getElementById(`subject-face-canvas-${terminalId}`);
+    if (!faceCanvas) return;
+    const ctx = faceCanvas.getContext('2d');
+    const cw = 320;
+    const ch = 240;
+    faceCanvas.width = cw;
+    faceCanvas.height = ch;
+
+    if (latestFaces[terminalId]) {
+      ctx.drawImage(latestFaces[terminalId], 0, 0, cw, ch);
+      if (face) {
+        drawFaceAnnotations(ctx, face, analysis.imageWidth, analysis.imageHeight, cw, ch);
+      }
+    } else {
+      drawUnknownUser(ctx, cw, ch);
+    }
   });
 }
 
-function handleCameraFrame(sourceId, jpegBytes) {
-  ensureFeedExists(sourceId);
-  renderJpegToCanvas(sourceId, jpegBytes);
+/**
+ * Draw an unknown user silhouette when no face image exists.
+ * Dark surveillance-style head/shoulders with targeting overlay.
+ */
+function drawUnknownUser(ctx, w, h) {
+  // Background
+  ctx.fillStyle = '#0a0a0a';
+  ctx.fillRect(0, 0, w, h);
 
-  const feed = document.querySelector(`.camera-feed[data-terminal="${sourceId}"]`);
-  if (feed) {
-    feed.classList.add('active');
-    const status = feed.querySelector('.feed-status');
-    if (status.textContent === '--' && clientInfo[sourceId]) {
-      status.textContent = clientInfo[sourceId].ip;
+  const cx = w / 2;
+  const headR = w * 0.12;
+  const headY = h * 0.35;
+
+  // Head circle
+  ctx.fillStyle = '#181818';
+  ctx.beginPath();
+  ctx.arc(cx, headY, headR, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Shoulders arc
+  ctx.beginPath();
+  ctx.ellipse(cx, h * 0.85, w * 0.28, h * 0.3, 0, Math.PI, 0);
+  ctx.fill();
+
+  // Neck
+  ctx.fillRect(cx - headR * 0.4, headY + headR - 2, headR * 0.8, h * 0.12);
+
+  // Targeting reticle over the head
+  ctx.strokeStyle = 'rgba(255, 204, 0, 0.3)';
+  ctx.lineWidth = 1.5;
+  const rr = headR * 1.8;
+
+  // Outer circle
+  ctx.beginPath();
+  ctx.arc(cx, headY, rr, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // Crosshairs
+  ctx.strokeStyle = 'rgba(255, 204, 0, 0.2)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(cx - rr * 1.5, headY);
+  ctx.lineTo(cx - rr * 0.3, headY);
+  ctx.moveTo(cx + rr * 0.3, headY);
+  ctx.lineTo(cx + rr * 1.5, headY);
+  ctx.moveTo(cx, headY - rr * 1.5);
+  ctx.lineTo(cx, headY - rr * 0.3);
+  ctx.moveTo(cx, headY + rr * 0.3);
+  ctx.lineTo(cx, headY + rr * 1.5);
+  ctx.stroke();
+
+  // Corner brackets
+  ctx.strokeStyle = 'rgba(255, 204, 0, 0.25)';
+  ctx.lineWidth = 1;
+  const bx = cx - w * 0.3, by = h * 0.08, bw = w * 0.6, bh = h * 0.75;
+  const cl = bw * 0.15;
+  ctx.beginPath();
+  ctx.moveTo(bx, by + cl); ctx.lineTo(bx, by); ctx.lineTo(bx + cl, by);
+  ctx.moveTo(bx + bw - cl, by); ctx.lineTo(bx + bw, by); ctx.lineTo(bx + bw, by + cl);
+  ctx.moveTo(bx, by + bh - cl); ctx.lineTo(bx, by + bh); ctx.lineTo(bx + cl, by + bh);
+  ctx.moveTo(bx + bw - cl, by + bh); ctx.lineTo(bx + bw, by + bh); ctx.lineTo(bx + bw, by + bh - cl);
+  ctx.stroke();
+
+  // "NO ID" label
+  ctx.fillStyle = 'rgba(255, 204, 0, 0.4)';
+  ctx.font = 'bold 14px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('NO ID', cx, h * 0.92);
+  ctx.textAlign = 'left';
+
+  // Scan lines
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.06)';
+  for (let y = 0; y < h; y += 3) {
+    ctx.fillRect(0, y, w, 1);
+  }
+}
+
+function detail(label, value) {
+  return `<div class="subject-detail"><span class="subject-detail-label">${label}</span><span class="subject-detail-value">${value}</span></div>`;
+}
+
+function esc(str) {
+  const div = document.createElement('div');
+  div.textContent = str || '';
+  return div.innerHTML;
+}
+
+/**
+ * Draw surveillance-style facial annotation overlay.
+ * Yellow targeting reticles, green landmark traces, red crosshairs.
+ */
+function drawFaceAnnotations(ctx, face, srcW, srcH, dstW, dstH) {
+  const sx = dstW / srcW;
+  const sy = dstH / srcH;
+
+  const b = face.box;
+  const bx = b.x * sx, by = b.y * sy, bw = b.width * sx, bh = b.height * sy;
+  const cornerLen = Math.min(bw, bh) * 0.25;
+
+  // --- Yellow bounding box with corner brackets ---
+  ctx.strokeStyle = '#ffcc00';
+  ctx.lineWidth = 2;
+
+  ctx.beginPath();
+  ctx.moveTo(bx, by + cornerLen); ctx.lineTo(bx, by); ctx.lineTo(bx + cornerLen, by);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(bx + bw - cornerLen, by); ctx.lineTo(bx + bw, by); ctx.lineTo(bx + bw, by + cornerLen);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(bx, by + bh - cornerLen); ctx.lineTo(bx, by + bh); ctx.lineTo(bx + cornerLen, by + bh);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(bx + bw - cornerLen, by + bh); ctx.lineTo(bx + bw, by + bh); ctx.lineTo(bx + bw, by + bh - cornerLen);
+  ctx.stroke();
+
+  // Thin full bounding box
+  ctx.strokeStyle = 'rgba(255, 204, 0, 0.2)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(bx, by, bw, bh);
+
+  // --- Green jawline trace ---
+  if (face.landmarks.jawline && face.landmarks.jawline.length > 2) {
+    ctx.strokeStyle = 'rgba(0, 255, 100, 0.5)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(face.landmarks.jawline[0].x * sx, face.landmarks.jawline[0].y * sy);
+    for (let i = 1; i < face.landmarks.jawline.length; i++) {
+      ctx.lineTo(face.landmarks.jawline[i].x * sx, face.landmarks.jawline[i].y * sy);
+    }
+    ctx.stroke();
+
+    // Jawline dots
+    ctx.fillStyle = 'rgba(0, 255, 100, 0.6)';
+    for (const pt of face.landmarks.jawline) {
+      ctx.beginPath();
+      ctx.arc(pt.x * sx, pt.y * sy, 2, 0, Math.PI * 2);
+      ctx.fill();
     }
   }
 
-  if (examineTerminal === sourceId) {
-    renderJpegToExamine(jpegBytes);
+  // --- Red eye targeting circles + crosshairs ---
+  for (const eye of [face.landmarks.leftEyeCenter, face.landmarks.rightEyeCenter]) {
+    const ex = eye.x * sx;
+    const ey = eye.y * sy;
+    const r = Math.max(6, bw * 0.08);
+
+    // Outer targeting circle
+    ctx.strokeStyle = 'rgba(255, 60, 60, 0.7)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(ex, ey, r, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // Inner dot
+    ctx.fillStyle = 'rgba(255, 60, 60, 0.5)';
+    ctx.beginPath();
+    ctx.arc(ex, ey, 2, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Crosshair lines
+    ctx.strokeStyle = 'rgba(255, 60, 60, 0.5)';
+    ctx.lineWidth = 1;
+    const ext = r * 2.5;
+    ctx.beginPath();
+    ctx.moveTo(ex - ext, ey); ctx.lineTo(ex - r * 0.5, ey);
+    ctx.moveTo(ex + r * 0.5, ey); ctx.lineTo(ex + ext, ey);
+    ctx.moveTo(ex, ey - ext); ctx.lineTo(ex, ey - r * 0.5);
+    ctx.moveTo(ex, ey + r * 0.5); ctx.lineTo(ex, ey + ext);
+    ctx.stroke();
+  }
+
+  // --- Nose crosshair (cyan) ---
+  const nx = face.landmarks.noseTip.x * sx;
+  const ny = face.landmarks.noseTip.y * sy;
+  ctx.strokeStyle = 'rgba(0, 200, 255, 0.5)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(nx - 5, ny); ctx.lineTo(nx + 5, ny);
+  ctx.moveTo(nx, ny - 5); ctx.lineTo(nx, ny + 5);
+  ctx.stroke();
+  ctx.fillStyle = 'rgba(0, 200, 255, 0.4)';
+  ctx.beginPath();
+  ctx.arc(nx, ny, 2, 0, Math.PI * 2);
+  ctx.fill();
+
+  // --- Mouth marker (cyan) ---
+  const mx = face.landmarks.mouthCenter.x * sx;
+  const my = face.landmarks.mouthCenter.y * sy;
+  ctx.strokeStyle = 'rgba(0, 200, 255, 0.4)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(mx - 8, my); ctx.lineTo(mx + 8, my);
+  ctx.stroke();
+  ctx.fillStyle = 'rgba(0, 200, 255, 0.3)';
+  ctx.beginPath();
+  ctx.arc(mx, my, 2, 0, Math.PI * 2);
+  ctx.fill();
+
+  // --- Center crosshair (dim) ---
+  const cx = bx + bw / 2;
+  const cy = by + bh / 2;
+  ctx.strokeStyle = 'rgba(255, 204, 0, 0.08)';
+  ctx.lineWidth = 0.5;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath();
+  ctx.moveTo(bx, cy); ctx.lineTo(bx + bw, cy);
+  ctx.moveTo(cx, by); ctx.lineTo(cx, by + bh);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // --- Scan lines ---
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.06)';
+  for (let y = 0; y < dstH; y += 3) {
+    ctx.fillRect(0, y, dstW, 1);
+  }
+
+  // --- Labels ---
+  const fontSize = Math.max(9, dstW * 0.055);
+  ctx.font = `bold ${fontSize}px monospace`;
+  ctx.textAlign = 'left';
+
+  // Top label: FACE_0 with yellow
+  ctx.fillStyle = 'rgba(255, 204, 0, 0.8)';
+  ctx.fillText(`FACE_0`, bx, by - 6);
+
+  // Box dimensions (dimmer)
+  ctx.font = `${fontSize * 0.8}px monospace`;
+  ctx.fillStyle = 'rgba(255, 204, 0, 0.4)';
+  ctx.fillText(`[${b.x},${b.y} ${b.width}x${b.height}]`, bx, by + bh + fontSize + 2);
+
+  // Bottom label: age/gender
+  ctx.font = `bold ${fontSize}px monospace`;
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.8)';
+  const label = `${face.gender.toUpperCase()} ~${Math.round(face.age)} ${face.expression.dominant.toUpperCase()}`;
+  ctx.fillText(label, bx, by + bh + fontSize * 2 + 4);
+
+  // Confidence (top-right)
+  ctx.fillStyle = 'rgba(255, 204, 0, 0.6)';
+  ctx.textAlign = 'right';
+  ctx.fillText(`${Math.round(face.genderConfidence * 100)}%`, bx + bw, by - 6);
+  ctx.textAlign = 'left';
+}
+
+// ---- Text Messages ----
+
+// ---- Loop Engine ----
+
+function playAudioSamples(samples) {
+  if (!audioCtx || internalMuted) return;
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  playSilboAsync(audioCtx, samples);
+}
+
+function startLoop(terminalId) {
+  const mx = getMixer(terminalId);
+  if (!mx.lastSamples) return;
+  mx.looping = true;
+
+  function tick() {
+    if (!mx.looping) return;
+    if (shouldPlay(terminalId)) {
+      playAudioSamples(mx.lastSamples);
+    }
+    // MIDI loop: replay the melody notes
+    if (mx.lastText) {
+      midi.sendMelodyMIDI(terminalId, mx.lastText, mx.lastDurationMs, getFreq, PUNCT_PERC);
+    }
+    mx.loopTimer = setTimeout(tick, mx.lastDurationMs);
+  }
+  tick();
+}
+
+function stopLoop(terminalId) {
+  const mx = getMixer(terminalId);
+  mx.looping = false;
+  if (mx.loopTimer) {
+    clearTimeout(mx.loopTimer);
+    mx.loopTimer = null;
+  }
+  // Update button state
+  const btn = document.querySelector(`.mixer-controls[data-terminal="${terminalId}"] [data-action="loop"]`);
+  if (btn) btn.classList.remove('active');
+}
+
+// ---- Quantize Engine ----
+
+function scheduleQuantized(callback, audioCtx) {
+  if (!globalQuantize || !audioCtx) {
+    callback();
+    return;
+  }
+  const beatDuration = 60 / globalBPM;
+  const now = audioCtx.currentTime;
+  if (!quantizeStartTime) quantizeStartTime = now;
+  const elapsed = now - quantizeStartTime;
+  const nextBeat = Math.ceil(elapsed / beatDuration) * beatDuration + quantizeStartTime;
+  const delay = Math.max(0, (nextBeat - now) * 1000);
+  setTimeout(callback, delay);
+}
+
+// ---- Text Message Handler ----
+
+function handleTextMessage(msg) {
+  const { terminal: sourceId, name: senderName, text } = msg;
+
+  messageCount++;
+  elStats.textContent = `${messageCount} messages`;
+
+  // Generate Silbo audio — use voice profile from face analysis if available
+  const fa = faceAnalysis[sourceId];
+  const voiceProfile = (fa && fa.faces && fa.faces[0])
+    ? deriveVoiceProfile(fa.faces[0])
+    : getWaveform(sourceId);
+  const { samples: silboAudio, durationMs } = synthesizeSilbo(text, voiceProfile);
+
+  // Store for loop playback
+  const mx = getMixer(sourceId);
+  mx.lastSamples = silboAudio;
+  mx.lastDurationMs = durationMs;
+  mx.lastText = text;
+
+  // Play audio (respecting mute/solo/quantize)
+  if (shouldPlay(sourceId)) {
+    scheduleQuantized(() => {
+      if (audioCtx && shouldPlay(sourceId)) {
+        playAudioSamples(silboAudio);
+      }
+      // MIDI output: send melody notes to this terminal's channel
+      midi.sendMelodyMIDI(sourceId, text, durationMs, getFreq, PUNCT_PERC);
+    }, audioCtx);
+  }
+
+  // Create swim lane
+  const lane = createLane(sourceId);
+  const body = lane.querySelector('.op-lane-body');
+
+  // Waveform
+  const waveCanvas = document.createElement('canvas');
+  waveCanvas.className = 'op-lane-waveform';
+  waveCanvas.width = 600;
+  waveCanvas.height = 24;
+  drawMiniWaveform(waveCanvas, silboAudio);
+  body.appendChild(waveCanvas);
+
+  // Text
+  const textDiv = document.createElement('div');
+  textDiv.className = 'op-lane-text decoded';
+  textDiv.textContent = text;
+  body.appendChild(textDiv);
+
+  // Device info
+  const info = clientInfo[sourceId];
+  if (info) {
+    const deviceDiv = document.createElement('div');
+    deviceDiv.className = 'op-lane-device';
+    const fp = info.fingerprint || {};
+    deviceDiv.textContent = [
+      fp.ip || info.ip,
+      fp.city,
+      fp.gpuRenderer ? fp.gpuRenderer.slice(0, 40) : '',
+    ].filter(Boolean).join(' | ');
+    body.appendChild(deviceDiv);
+  }
+
+  // Animate active state on swim lane
+  lane.classList.add('active');
+  setTimeout(() => lane.classList.remove('active'), durationMs);
+
+  // Green transmitting state on subject card
+  const card = document.getElementById(`subject-${sourceId}`);
+  if (card) {
+    card.classList.add('transmitting');
+    setTimeout(() => card.classList.remove('transmitting'), durationMs);
+  }
+
+  // Print
+  if (printer && printer.connected && text) {
+    printSurveillanceReceipt(sourceId, silboAudio, { text, confidence: 1.0 });
   }
 }
 
-function handleFaceSnap(sourceId, jpegBytes) {
-  ensureFeedExists(sourceId);
-
-  const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
-  latestFaceBlobs[sourceId] = blob;
-  createImageBitmap(blob).then(bmp => {
-    latestFaces[sourceId] = bmp;
-  });
-
-  const feed = document.querySelector(`.camera-feed[data-terminal="${sourceId}"]`);
-  if (feed) {
-    feed.classList.add('flagged');
-    setTimeout(() => feed.classList.remove('flagged'), 2000);
-  }
-
-  renderJpegToCanvas(sourceId, jpegBytes);
-}
-
-function renderJpegToCanvas(sourceId, jpegBytes) {
-  const ctx = feedContexts[sourceId];
-  if (!ctx) return;
-
-  const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
-  createImageBitmap(blob).then(bmp => {
-    ctx.drawImage(bmp, 0, 0, feedCanvases[sourceId].width, feedCanvases[sourceId].height);
-    bmp.close();
-  });
-}
-
-function renderJpegToExamine(jpegBytes) {
-  const ctx = elExamineCanvas.getContext('2d');
-  const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
-  createImageBitmap(blob).then(bmp => {
-    ctx.drawImage(bmp, 0, 0, elExamineCanvas.width, elExamineCanvas.height);
-    bmp.close();
-  });
-}
-
-function showExamine(terminalId) {
-  examineTerminal = terminalId;
-  elExamineLabel.textContent = `T${String(terminalId).padStart(2, '0')}`;
-  elExamine.classList.remove('hidden');
-}
-
-function hideExamine() {
-  examineTerminal = null;
-  elExamine.classList.add('hidden');
-}
-
-// ---- Audio ----
+// ---- Audio (legacy binary relay) ----
 
 function handleAudio(sourceId, audioBytes) {
-  // Copy to aligned buffer (WebSocket offset isn't 4-byte aligned)
   const aligned = new ArrayBuffer(audioBytes.byteLength);
   new Uint8Array(aligned).set(audioBytes);
   const samples = new Float32Array(aligned);
 
-  // Play through speakers (fire and forget — overlapping is intentional)
   if (audioCtx) {
     if (audioCtx.state === 'suspended') audioCtx.resume();
     const buffer = audioCtx.createBuffer(1, samples.length, SAMPLE_RATE);
@@ -320,48 +1083,66 @@ function handleAudio(sourceId, audioBytes) {
     source.connect(audioCtx.destination);
     source.start();
   }
-
-  // Decode the message
-  const result = decodeMessage(samples, sourceId);
-
-  // Create operator swim lane with face + waveform + text
-  createOperatorLane(sourceId, samples, result);
-
-  // Update stats
-  messageCount++;
-  elStats.textContent = `${messageCount} messages`;
-
-  // Print to thermal printer (face + waveform + text → shredder)
-  if (printer && printer.connected && result && result.text) {
-    printSurveillanceReceipt(sourceId, samples, result);
-  }
 }
 
-// ---- Operator Swim Lanes ----
+// ---- Shared Lane Creator ----
 
-function createOperatorLane(sourceId, samples, decodeResult) {
+/**
+ * Add a compact event indicator to the swim lanes.
+ */
+function addEventLane(terminalId, eventType, name) {
   const lane = document.createElement('div');
-  lane.className = 'op-lane active';
+  lane.className = 'op-lane event';
+
+  const body = document.createElement('div');
+  body.className = 'op-lane-body';
+
+  const typeSpan = document.createElement('span');
+  typeSpan.className = `event-type ${eventType}`;
+  typeSpan.textContent = eventType === 'connect' ? 'CONNECT' : 'DISCONNECT';
+
+  const nameSpan = document.createElement('span');
+  nameSpan.className = 'op-lane-id';
+  nameSpan.textContent = name;
+
+  const timeSpan = document.createElement('span');
+  timeSpan.className = 'op-lane-time';
+  timeSpan.textContent = new Date().toTimeString().slice(0, 8);
+
+  body.appendChild(typeSpan);
+  body.appendChild(nameSpan);
+  body.appendChild(timeSpan);
+  lane.appendChild(body);
+
+  elLanes.insertBefore(lane, elLanes.firstChild);
+
+  // Auto-remove after 30 seconds to keep it clean
+  setTimeout(() => {
+    if (lane.parentNode) lane.style.opacity = '0.3';
+  }, 30000);
+}
+
+function createLane(sourceId, type) {
+  const lane = document.createElement('div');
+  lane.className = `op-lane${type ? ' ' + type : ''}`;
 
   // Face thumbnail
   const faceCanvas = document.createElement('canvas');
   faceCanvas.className = 'op-lane-face';
-  faceCanvas.width = 60;
-  faceCanvas.height = 45;
+  faceCanvas.width = 48;
+  faceCanvas.height = 48;
   const faceCtx = faceCanvas.getContext('2d');
 
-  // Draw face if we have a recent snapshot
   if (latestFaces[sourceId]) {
-    faceCtx.drawImage(latestFaces[sourceId], 0, 0, 60, 45);
+    faceCtx.drawImage(latestFaces[sourceId], 0, 0, 48, 48);
+    const fa = faceAnalysis[sourceId];
+    if (fa && fa.faces && fa.faces[0]) {
+      drawFaceAnnotations(faceCtx, fa.faces[0], fa.imageWidth, fa.imageHeight, 48, 48);
+    }
   } else {
-    faceCtx.fillStyle = '#0a0a0a';
-    faceCtx.fillRect(0, 0, 60, 45);
-    faceCtx.fillStyle = '#222';
-    faceCtx.font = '9px monospace';
-    faceCtx.fillText('NO FEED', 4, 25);
+    drawUnknownUser(faceCtx, 48, 48);
   }
 
-  // Body: header + waveform + text
   const body = document.createElement('div');
   body.className = 'op-lane-body';
 
@@ -380,52 +1161,47 @@ function createOperatorLane(sourceId, samples, decodeResult) {
   header.appendChild(idSpan);
   header.appendChild(timeSpan);
 
-  // Waveform
-  const waveCanvas = document.createElement('canvas');
-  waveCanvas.className = 'op-lane-waveform';
-  waveCanvas.width = 600;
-  waveCanvas.height = 24;
-  drawMiniWaveform(waveCanvas, samples);
-
-  // Decoded text
-  const textDiv = document.createElement('div');
-  textDiv.className = 'op-lane-text';
-
-  if (decodeResult && decodeResult.text) {
-    textDiv.textContent = decodeResult.text;
-    textDiv.classList.add('decoded');
-  } else {
-    textDiv.textContent = '[decode failed]';
-  }
-
-  // Device info line
-  const deviceDiv = document.createElement('div');
-  deviceDiv.style.cssText = 'color:#333;font-size:10px;margin-bottom:2px;word-break:break-all;';
-  if (info) {
-    deviceDiv.textContent = `${info.ip} | ${(info.ua || '').slice(0, 80)}`;
+  // Add face analysis summary to header if available
+  const fa = faceAnalysis[sourceId];
+  if (fa && fa.faces && fa.faces[0]) {
+    const f = fa.faces[0];
+    const tagSpan = document.createElement('span');
+    tagSpan.style.cssText = 'color:#333;font-size:9px;letter-spacing:1px;';
+    tagSpan.textContent = `${f.gender.toUpperCase()} ~${Math.round(f.age)} ${f.expression.dominant.toUpperCase()}`;
+    header.appendChild(tagSpan);
   }
 
   body.appendChild(header);
-  body.appendChild(deviceDiv);
-  body.appendChild(waveCanvas);
-  body.appendChild(textDiv);
-
   lane.appendChild(faceCanvas);
   lane.appendChild(body);
 
   elLanes.insertBefore(lane, elLanes.firstChild);
-
-  // Remove 'active' after audio finishes
-  const durationMs = (samples.length / SAMPLE_RATE) * 1000;
-  setTimeout(() => lane.classList.remove('active'), durationMs);
+  return lane;
 }
+
+// ---- Face Snap Storage ----
+
+function handleFaceSnap(fullId, jpegBytes) {
+  const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
+  latestFaceBlobs[fullId] = blob;
+  createImageBitmap(blob).then(bmp => {
+    latestFaces[fullId] = bmp;
+    createOrUpdateSubjectCard(fullId);
+  });
+}
+
+function handleCameraFrame() {
+  // Camera grid removed — faces shown in subject cards only
+}
+
+// ---- Waveform Drawing ----
 
 function drawMiniWaveform(canvas, samples) {
   const ctx = canvas.getContext('2d');
   const w = canvas.width;
   const h = canvas.height;
 
-  ctx.fillStyle = '#050505';
+  ctx.fillStyle = '#030303';
   ctx.fillRect(0, 0, w, h);
 
   ctx.strokeStyle = '#333';
@@ -441,21 +1217,19 @@ function drawMiniWaveform(canvas, samples) {
       rms += s * s;
     }
     rms = Math.sqrt(rms / step);
-    const y = h / 2 - rms * h;
-    const y2 = h / 2 + rms * h;
-    ctx.moveTo(x, y);
-    ctx.lineTo(x, y2);
+    ctx.moveTo(x, h / 2 - rms * h);
+    ctx.lineTo(x, h / 2 + rms * h);
   }
   ctx.stroke();
 }
 
-// ---- Thermal Printer (Surveillance Edition) ----
+// ---- Thermal Printer ----
 
 async function connectPrinter() {
   printer = new ThermalPrinter();
   try {
     await printer.connect();
-    elPrinterStatus.textContent = `CONNECTED`;
+    elPrinterStatus.textContent = 'CONNECTED';
     await printer.printStatus('SILBERO DIGITAL // OPERATOR');
   } catch (e) {
     elPrinterStatus.textContent = 'FAILED';
@@ -466,63 +1240,59 @@ async function connectPrinter() {
 async function printSurveillanceReceipt(sourceId, samples, result) {
   if (!printer || !printer.connected) return;
 
-  const termStr = String(sourceId).padStart(2, '0');
+  const termStr = String(sourceId).padStart(5, '0');
   const timeStr = new Date().toTimeString().slice(0, 8);
 
-  // Header
   await printer.sendBytes([0x1B, 0x61, 0x01]); // Center
   await printer.sendBytes([0x1B, 0x45, 0x01]); // Bold
   await printer.sendText(`T${termStr} // ${timeStr}`);
   await printer.sendBytes([0x0A]);
-  await printer.sendBytes([0x1B, 0x45, 0x00]); // Bold off
+  await printer.sendBytes([0x1B, 0x45, 0x00]);
 
-  // Face image (if available) — print as raster bitmap
+  // Face analysis summary
+  const fa = faceAnalysis[sourceId];
+  if (fa && fa.faces && fa.faces[0]) {
+    const f = fa.faces[0];
+    await printer.sendText(`${f.gender.toUpperCase()} ~${Math.round(f.age)} ${f.expression.dominant.toUpperCase()}`);
+    await printer.sendBytes([0x0A]);
+    await printer.sendText(`${f.eyeColor.color} eyes / ${f.skinTone.label} / ${f.faceShape}`);
+    await printer.sendBytes([0x0A]);
+  }
+
   if (latestFaceBlobs[sourceId]) {
     try {
       await printFaceBitmap(sourceId);
-    } catch (e) {
-      await printer.sendText('[NO FACE DATA]');
-      await printer.sendBytes([0x0A]);
-    }
+    } catch (e) {}
   }
 
-  // Decoded text
-  await printer.sendBytes([0x1B, 0x61, 0x00]); // Left align
-  await printer.sendBytes([0x1D, 0x21, 0x01]); // Double height
+  await printer.sendBytes([0x1B, 0x61, 0x00]);
+  await printer.sendBytes([0x1D, 0x21, 0x01]);
   await printer.sendText(result.text);
   await printer.sendBytes([0x0A]);
-  await printer.sendBytes([0x1D, 0x21, 0x00]); // Normal
+  await printer.sendBytes([0x1D, 0x21, 0x00]);
 
-  // Confidence
-  await printer.sendBytes([0x1B, 0x61, 0x01]); // Center
+  await printer.sendBytes([0x1B, 0x61, 0x01]);
   const confStr = Math.round(result.confidence * 100);
   await printer.sendText(`[${confStr}%]`);
   await printer.sendBytes([0x0A]);
 
-  // Separator
   await printer.sendText('________________________');
-  await printer.sendBytes([0x1B, 0x64, 2]); // Feed 2 lines
+  await printer.sendBytes([0x1B, 0x64, 2]);
 
-  // Partial cut
   try {
     await printer.sendBytes([0x1D, 0x56, 0x01]);
   } catch (_) {}
 }
 
-/**
- * Print face as a dithered bitmap on the thermal printer.
- * Converts the JPEG to a 1-bit black/white bitmap suitable for ESC/POS.
- */
 async function printFaceBitmap(sourceId) {
   const blob = latestFaceBlobs[sourceId];
   if (!blob) return;
 
   const bmp = await createImageBitmap(blob);
-  const printWidth = 384; // 48mm at 8 dots/mm (standard 80mm printer)
+  const printWidth = 384;
   const scale = printWidth / bmp.width;
   const printHeight = Math.floor(bmp.height * scale);
 
-  // Render to canvas, grayscale
   const canvas = new OffscreenCanvas(printWidth, printHeight);
   const ctx = canvas.getContext('2d');
   ctx.filter = 'grayscale(100%) contrast(1.5)';
@@ -532,10 +1302,9 @@ async function printFaceBitmap(sourceId) {
   const imageData = ctx.getImageData(0, 0, printWidth, printHeight);
   const pixels = imageData.data;
 
-  // Convert to 1-bit with Floyd-Steinberg dithering
   const gray = new Float32Array(printWidth * printHeight);
   for (let i = 0; i < gray.length; i++) {
-    gray[i] = pixels[i * 4] / 255; // Already grayscale
+    gray[i] = pixels[i * 4] / 255;
   }
 
   for (let y = 0; y < printHeight; y++) {
@@ -554,7 +1323,6 @@ async function printFaceBitmap(sourceId) {
     }
   }
 
-  // ESC/POS raster bit image: GS v 0
   const bytesPerRow = Math.ceil(printWidth / 8);
   const cmd = [
     0x1D, 0x76, 0x30, 0x00,
@@ -563,12 +1331,10 @@ async function printFaceBitmap(sourceId) {
   ];
   await printer.sendBytes(cmd);
 
-  // Send bitmap data row by row
   for (let y = 0; y < printHeight; y++) {
     const row = new Uint8Array(bytesPerRow);
     for (let x = 0; x < printWidth; x++) {
       if (gray[y * printWidth + x] < 0.5) {
-        // Dark pixel = print dot
         row[Math.floor(x / 8)] |= (0x80 >> (x % 8));
       }
     }

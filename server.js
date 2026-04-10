@@ -19,6 +19,7 @@ const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
 const { WebSocketServer } = require('ws');
+const { loadModels, analyzeFace } = require('./face-analysis');
 
 const PORT = parseInt(process.argv[2], 10) || 8443;
 const HTTP_PORT = 8080;
@@ -202,7 +203,18 @@ function setupWebSocket(server) {
           if (op.ws.readyState === 1) op.ws.send(data);
         }
       } else if (msgType === MSG_FACE_SNAP) {
-        // Selfie portraits go to operators AND other terminals (for avatars)
+        // Send ID mapping to operators FIRST (before binary, so they can resolve)
+        const snapNotify = JSON.stringify({
+          type: 'face-snap-id',
+          binarySourceByte: source,
+          terminal: client.id || source,
+          name: client.name,
+        });
+        for (const op of operators) {
+          if (op.ws.readyState === 1) op.ws.send(snapNotify);
+        }
+
+        // Then relay binary to operators and other terminals
         for (const op of operators) {
           if (op.ws.readyState === 1) op.ws.send(data);
         }
@@ -210,12 +222,57 @@ function setupWebSocket(server) {
           if (other === client) continue;
           if (other.ws.readyState === 1) other.ws.send(data);
         }
+
+        // Store face snap for operator replay on reconnect
+        const jpegBuf = Buffer.from(bytes.buffer, bytes.byteOffset + 2, bytes.length - 2);
+        client.faceSnapJpeg = jpegBuf;
+
+        // Run server-side face analysis (async, non-blocking)
+        analyzeFace(jpegBuf).then(analysis => {
+          if (!analysis) {
+            console.log(`  FACE: T${source} "${client.name}" — analysis returned null`);
+            return;
+          }
+          client.faceAnalysis = analysis;
+          const tid = client.id || source;
+          const faceCount = analysis.faces.length;
+          console.log(`  FACE: T${tid} "${client.name}" — ${faceCount} face(s) detected (${jpegBuf.length} bytes)`);
+          if (faceCount > 0) {
+            const f = analysis.faces[0];
+            console.log(`    ${f.gender} ~${Math.round(f.age)}y ${f.expression.dominant} ${f.skinTone.label} ${f.eyeColor.color}-eyes ${f.faceShape} sym:${f.symmetry}`);
+          }
+          // Send to operators even if 0 faces (so card updates from AWAITING)
+          const msg = JSON.stringify({
+            type: 'face-analysis',
+            terminal: tid,
+            name: client.name,
+            analysis,
+          });
+          for (const op of operators) {
+            if (op.ws.readyState === 1) op.ws.send(msg);
+          }
+        }).catch(e => {
+          console.error(`  FACE ERROR: T${source} "${client.name}" — ${e.message}`);
+        });
       }
     });
 
     ws.on('close', () => {
       terminals.delete(client);
       console.log(`  WS: terminal disconnected (${terminals.size} terminals)`);
+
+      // Notify operators of disconnect
+      if (client.id) {
+        const msg = JSON.stringify({
+          type: 'disconnect',
+          terminal: client.id,
+          name: client.name,
+          time: new Date().toISOString(),
+        });
+        for (const op of operators) {
+          if (op.ws.readyState === 1) op.ws.send(msg);
+        }
+      }
     });
   });
 
@@ -224,6 +281,63 @@ function setupWebSocket(server) {
     const client = { ws };
     operators.add(client);
     console.log(`  WS: operator connected (${operators.size} operators)`);
+
+    // Replay current state to newly connected operator
+    for (const t of terminals) {
+      if (!t.id) continue; // not yet registered
+
+      // Replay dossier
+      if (t.dossier) {
+        const dossierMsg = JSON.stringify({
+          type: 'dossier',
+          terminal: t.id,
+          name: t.name,
+          ip: t.ip, ua: t.ua,
+          time: new Date().toISOString(),
+          ...t.dossier,
+        });
+        ws.send(dossierMsg);
+      }
+
+      // Replay face snap (ID mapping first, then binary)
+      if (t.faceSnapJpeg) {
+        ws.send(JSON.stringify({
+          type: 'face-snap-id',
+          binarySourceByte: t.id & 0xFF,
+          terminal: t.id,
+          name: t.name,
+        }));
+
+        const packet = new Uint8Array(2 + t.faceSnapJpeg.length);
+        packet[0] = MSG_FACE_SNAP;
+        packet[1] = t.id & 0xFF;
+        packet.set(t.faceSnapJpeg, 2);
+        ws.send(packet);
+      }
+
+      // Replay face analysis
+      if (t.faceAnalysis) {
+        ws.send(JSON.stringify({
+          type: 'face-analysis',
+          terminal: t.id,
+          name: t.name,
+          analysis: t.faceAnalysis,
+        }));
+      }
+    }
+
+    // Handle operator commands
+    ws.on('message', (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.command === 'disconnect-all') {
+          console.log('  OP: disconnect-all command received');
+          for (const t of terminals) {
+            t.ws.close(1000, 'Operator disconnect');
+          }
+        }
+      } catch (e) {}
+    });
 
     ws.on('close', () => {
       operators.delete(client);
@@ -249,6 +363,13 @@ const options = {
 // HTTPS server (primary)
 const server = https.createServer(options, handleRequest);
 setupWebSocket(server);
+
+// Load face analysis models before accepting connections
+loadModels().then(() => {
+  console.log('  Face analysis ready.\n');
+}).catch(e => {
+  console.warn('  Face analysis unavailable:', e.message);
+});
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`\n  SILBERO DIGITAL SERVER`);

@@ -8,26 +8,83 @@
 </head>
 <body>
   <div id="operator">
-    <!-- Top: camera grid -->
-    <!-- Camera feeds created dynamically as terminals connect -->
-    <div id="camera-grid"></div>
+    <!-- Subject profiles (populated by face analysis) -->
+    <div id="subject-profiles"></div>
 
-    <!-- Full-screen examine view (hidden by default) -->
-    <div id="examine-view" class="hidden">
-      <canvas id="examine-canvas" width="640" height="480"></canvas>
-      <div id="examine-label">T--</div>
-      <div id="examine-close">ESC</div>
-    </div>
-
-    <!-- Bottom: swim lanes for all decoded messages -->
+    <!-- Message swim lanes -->
     <div id="operator-lanes"></div>
 
-    <!-- Footer: printer + status -->
+    <!-- Footer -->
     <div id="operator-footer">
+      <button id="btn-quantize" class="mixer-toggle">QUANTIZE</button>
+      <span id="quantize-bpm">
+        <button id="bpm-down" class="bpm-btn">-</button>
+        <span id="bpm-display">120</span>
+        <button id="bpm-up" class="bpm-btn">+</button>
+      </span>
+      <span class="footer-sep">|</span>
+      <button id="btn-bass" class="mixer-toggle">BASS</button>
+      <select id="bass-pattern" class="bass-select">
+        <option value="psy">PSY</option>
+        <option value="drive">DRIVE</option>
+        <option value="off">OFFBEAT</option>
+        <option value="arp">ARP</option>
+        <option value="arpUp">ARP UP</option>
+        <option value="arpDn">ARP DN</option>
+        <option value="acid">ACID</option>
+      </select>
+      <select id="bass-octave" class="bass-select">
+        <option value="16">E0</option>
+        <option value="28" selected>E1</option>
+        <option value="40">E2</option>
+        <option value="52">E3</option>
+      </select>
+      <span class="footer-sep">|</span>
+      <button id="btn-midi" class="mixer-toggle">MIDI OUT</button>
+      <button id="btn-mute-internal" class="mixer-toggle">INT MUTE</button>
+      <button id="btn-global-pb" class="mixer-toggle active">PB</button>
+      <select id="scale-select" class="bass-select">
+        <option value="chromatic">CHROMATIC</option>
+        <option value="major">MAJOR</option>
+        <option value="minor">MINOR</option>
+        <option value="dorian">DORIAN</option>
+        <option value="mixolydian">MIXOLYDIAN</option>
+        <option value="phrygian">PHRYGIAN</option>
+        <option value="lydian">LYDIAN</option>
+        <option value="locrian">LOCRIAN</option>
+        <option value="pentatonic">PENT MAJ</option>
+        <option value="pent-minor">PENT MIN</option>
+        <option value="blues">BLUES</option>
+        <option value="harm-minor">HARM MIN</option>
+        <option value="whole-tone">WHOLE TONE</option>
+        <option value="hungarian">HUNGARIAN</option>
+        <option value="arabic">ARABIC</option>
+      </select>
+      <select id="root-select" class="bass-select">
+        <option value="0">C</option>
+        <option value="1">C#</option>
+        <option value="2">D</option>
+        <option value="3">D#</option>
+        <option value="4" selected>E</option>
+        <option value="5">F</option>
+        <option value="6">F#</option>
+        <option value="7">G</option>
+        <option value="8">G#</option>
+        <option value="9">A</option>
+        <option value="10">A#</option>
+        <option value="11">B</option>
+      </select>
+      <select id="midi-port" class="bass-select" disabled>
+        <option value="">NO DEVICE</option>
+      </select>
+      <span class="footer-sep">|</span>
+      <button id="btn-disconnect-all">DISCONNECT ALL</button>
       <button id="btn-op-printer">CONNECT PRINTER</button>
       <span id="op-printer-status">NO PRINTER</span>
+      <span class="footer-sep">|</span>
       <span id="op-ws-status">WS:--</span>
       <span id="op-stats">0 messages</span>
+      <span id="op-subjects">0 subjects</span>
     </div>
   </div>
 
