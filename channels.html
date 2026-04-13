@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SILBERO DIGITAL // CHANNELS</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #000;
+      color: #888;
+      font-family: 'Courier New', Courier, monospace;
+      font-size: 12px;
+      height: 100vh;
+      overflow-y: auto;
+      overflow-x: hidden;
+    }
+
+    #channels {
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+      gap: 1px;
+      padding: 2px;
+    }
+
+    .ch-group {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+    }
+    .ch-group:empty { display: none; }
+
+    .ch-lane {
+      display: flex;
+      align-items: center;
+      gap: 0;
+      background: #040404;
+      border: 1px solid #0a0a0a;
+      overflow: hidden;
+      position: relative;
+      height: 38px;
+      flex-shrink: 0;
+    }
+
+    /* Channel label */
+    .ch-label {
+      width: 48px;
+      flex-shrink: 0;
+      text-align: center;
+      font-size: 10px;
+      font-weight: bold;
+      letter-spacing: 2px;
+      color: #1a1a1a;
+      border-right: 1px solid #0a0a0a;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: color 0.03s, background 0.03s;
+    }
+
+    .ch-label.flash {
+      color: #fff;
+      background: #222;
+    }
+
+    /* Holzer scrolling area */
+    .ch-scroll {
+      flex: 1;
+      height: 100%;
+      position: relative;
+      overflow: hidden;
+    }
+
+    /* Each phrase scrolls left across the viewport like an LED sign.
+       Never clears. New loops start from the right. Multiple phrases
+       can coexist, scrolling at their own pace. */
+    .ch-ticker {
+      position: absolute;
+      top: 50%;
+      white-space: nowrap;
+      font-size: 20px;
+      letter-spacing: 4px;
+      padding: 0 16px;
+      will-change: transform;
+    }
+
+    .ch-sender {
+      color: #222;
+      font-size: 9px;
+      letter-spacing: 1px;
+      margin-right: 6px;
+    }
+
+    /* Characters: dim until their note fires, then they glow */
+    .ch-char {
+      color: #0a0a0a;
+      transition: none;
+    }
+
+    .ch-char.lit {
+      color: #ccc;
+      text-shadow: 0 0 10px rgba(255, 255, 255, 0.4);
+      transition: color 0.03s;
+    }
+
+    /* After the phrase completes, chars dim to a warm afterglow */
+    .ch-char.spent {
+      color: #2a2a2a;
+      text-shadow: none;
+      transition: color 1.5s;
+    }
+
+    /* Note flash indicator (bass/drums) */
+    .ch-note-flash {
+      position: absolute;
+      right: 8px;
+      top: 50%;
+      transform: translateY(-50%);
+      font-size: 9px;
+      color: #333;
+      letter-spacing: 1px;
+      z-index: 2;
+    }
+
+    /* Channel accent colors — left border */
+    .ch-group[data-ch="0"] .ch-lane { border-left: 2px solid #444; }
+    .ch-group[data-ch="1"] .ch-lane { border-left: 2px solid #446; }
+    .ch-group[data-ch="2"] .ch-lane { border-left: 2px solid #464; }
+    .ch-group[data-ch="3"] .ch-lane { border-left: 2px solid #644; }
+    .ch-group[data-ch="4"] .ch-lane { border-left: 2px solid #466; }
+    .ch-group[data-ch="5"] .ch-lane { border-left: 2px solid #646; }
+    .ch-group[data-ch="6"] .ch-lane { border-left: 2px solid #664; }
+    .ch-group[data-ch="7"] .ch-lane { border-left: 2px solid #555; }
+    .ch-group[data-ch="bass"] .ch-lane { border-left: 2px solid #636; }
+    .ch-group[data-ch="drums"] .ch-lane { border-left: 2px solid #663; }
+
+    /* Per-channel glow colors */
+    .ch-group[data-ch="0"] .ch-char.lit { color: #eee; text-shadow: 0 0 10px rgba(255,255,255,0.4); }
+    .ch-group[data-ch="1"] .ch-char.lit { color: #bbf; text-shadow: 0 0 10px rgba(180,180,255,0.4); }
+    .ch-group[data-ch="2"] .ch-char.lit { color: #bfb; text-shadow: 0 0 10px rgba(180,255,180,0.4); }
+    .ch-group[data-ch="3"] .ch-char.lit { color: #fbb; text-shadow: 0 0 10px rgba(255,180,180,0.4); }
+    .ch-group[data-ch="4"] .ch-char.lit { color: #bff; text-shadow: 0 0 10px rgba(180,255,255,0.4); }
+    .ch-group[data-ch="5"] .ch-char.lit { color: #fbf; text-shadow: 0 0 10px rgba(255,180,255,0.4); }
+    .ch-group[data-ch="6"] .ch-char.lit { color: #ffb; text-shadow: 0 0 10px rgba(255,255,180,0.4); }
+    .ch-group[data-ch="7"] .ch-char.lit { color: #ccc; text-shadow: 0 0 10px rgba(200,200,200,0.4); }
+
+    /* Label flash per channel */
+    .ch-group[data-ch="0"] .ch-label.flash { color: #fff; background: #333; }
+    .ch-group[data-ch="1"] .ch-label.flash { color: #bbf; background: #223; }
+    .ch-group[data-ch="2"] .ch-label.flash { color: #bfb; background: #232; }
+    .ch-group[data-ch="3"] .ch-label.flash { color: #fbb; background: #322; }
+    .ch-group[data-ch="4"] .ch-label.flash { color: #bff; background: #233; }
+    .ch-group[data-ch="5"] .ch-label.flash { color: #fbf; background: #323; }
+    .ch-group[data-ch="6"] .ch-label.flash { color: #ffb; background: #332; }
+    .ch-group[data-ch="7"] .ch-label.flash { color: #ccc; background: #2a2a2a; }
+    .ch-group[data-ch="bass"] .ch-label.flash { color: #c8c; background: #323; }
+    .ch-group[data-ch="drums"] .ch-label.flash { color: #cc8; background: #332; }
+
+    .ch-group .ch-lane:not(:first-child) .ch-label { color: #111; font-size: 8px; }
+
+    /* Scan lines */
+    .ch-lane::after {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: repeating-linear-gradient(
+        0deg, transparent, transparent 2px,
+        rgba(0,0,0,0.05) 2px, rgba(0,0,0,0.05) 4px
+      );
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="channels"></div>
+
+  <script>
+    const elChannels = document.getElementById('channels');
+
+    const channelDefs = [
+      { id: '0', label: 'CH 1' }, { id: '1', label: 'CH 2' },
+      { id: '2', label: 'CH 3' }, { id: '3', label: 'CH 4' },
+      { id: '4', label: 'CH 5' }, { id: '5', label: 'CH 6' },
+      { id: '6', label: 'CH 7' }, { id: '7', label: 'CH 8' },
+      { id: 'bass', label: 'BASS' }, { id: 'drums', label: 'DRUM' },
+    ];
+
+    const groups = {};
+    const sources = {};
+
+    for (const def of channelDefs) {
+      const group = document.createElement('div');
+      group.className = 'ch-group';
+      group.dataset.ch = def.id;
+      elChannels.appendChild(group);
+      groups[def.id] = { el: group, def };
+    }
+
+    function getSourceLane(chId, sourceId) {
+      const key = chId + ':' + sourceId;
+      if (sources[key]) return sources[key];
+
+      const group = groups[chId];
+      if (!group) return null;
+
+      const lane = document.createElement('div');
+      lane.className = 'ch-lane';
+
+      const label = document.createElement('div');
+      label.className = 'ch-label';
+      label.textContent = group.def.label;
+
+      const scroll = document.createElement('div');
+      scroll.className = 'ch-scroll';
+
+      const noteFlash = document.createElement('div');
+      noteFlash.className = 'ch-note-flash';
+
+      lane.appendChild(label);
+      lane.appendChild(scroll);
+      lane.appendChild(noteFlash);
+      group.el.appendChild(lane);
+
+      const entry = { lane, label, scroll, noteFlash, charTimers: [] };
+      sources[key] = entry;
+      return entry;
+    }
+
+    function flashChannelLabel(chId) {
+      const group = groups[chId];
+      if (!group) return;
+      group.el.querySelectorAll('.ch-label').forEach(l => {
+        l.classList.add('flash');
+        setTimeout(() => l.classList.remove('flash'), 50);
+      });
+    }
+
+    const bc = new BroadcastChannel('silbero-viz');
+
+    bc.onmessage = (e) => {
+      const msg = e.data;
+      switch (msg.type) {
+        case 'note':
+          holzerScroll(String(msg.channel), String(msg.sourceId), msg.text, msg.durationMs, msg.name);
+          break;
+        case 'tick':
+          flashChannelLabel(String(msg.channel));
+          break;
+        case 'bass':
+          flashBass(msg.midiNote);
+          break;
+        case 'drum':
+          flashDrum(msg.percType);
+          break;
+        case 'stop':
+          // Don't clear -- let existing text finish scrolling and fade naturally
+          break;
+      }
+    };
+
+    /**
+     * Holzer scroll: text enters from the right, scrolls left across the
+     * viewport as each character's MIDI note fires and lights up. When the
+     * phrase is complete, characters dim to an afterglow. On loop restart,
+     * a new ticker starts from the right -- the old one keeps scrolling left
+     * and eventually exits. Multiple phrases can coexist, overlapping.
+     *
+     * The text never clears. The lane is never blank. Like a Jenny Holzer
+     * LED installation in Times Square.
+     */
+    function holzerScroll(chId, sourceId, text, durationMs, senderName) {
+      const src = getSourceLane(chId, sourceId);
+      if (!src) return;
+
+      // Cancel any pending character timers from a previous iteration
+      // (but don't remove existing tickers -- they keep scrolling)
+      for (const t of src.charTimers) clearTimeout(t);
+      src.charTimers = [];
+
+      const container = src.scroll;
+      const containerWidth = container.offsetWidth || 800;
+
+      // Build ticker element
+      const ticker = document.createElement('div');
+      ticker.className = 'ch-ticker';
+
+      // Sender tag (dim, small)
+      const tag = document.createElement('span');
+      tag.className = 'ch-sender';
+      tag.textContent = senderName;
+      ticker.appendChild(tag);
+
+      // Pre-render all characters dim
+      const charSpans = [];
+      for (const ch of text) {
+        const span = document.createElement('span');
+        span.className = 'ch-char';
+        span.textContent = ch;
+        ticker.appendChild(span);
+        charSpans.push(span);
+      }
+
+      container.appendChild(ticker);
+
+      // Measure text width after DOM insertion
+      const textWidth = ticker.offsetWidth || (text.length * 20);
+
+      // Scroll: start from right edge, scroll left across viewport + text width
+      // Speed: the phrase should be centered in the viewport at the midpoint
+      // of its duration, so total scroll distance = containerWidth + textWidth
+      const totalDistance = containerWidth + textWidth;
+      const scrollDuration = durationMs * 1.5; // scroll a bit slower than the typing
+
+      // Start position: just off the right edge
+      const startX = containerWidth;
+      const endX = -textWidth;
+
+      // Set start position, force layout flush, THEN add transition.
+      // This avoids requestAnimationFrame which Chrome throttles in
+      // unfocused windows, causing the start position to be missed.
+      ticker.style.transition = 'none';
+      ticker.style.transform = `translate(${startX}px, -50%)`;
+      ticker.offsetWidth; // force synchronous layout flush
+      ticker.style.transition = `transform ${scrollDuration}ms linear`;
+      ticker.style.transform = `translate(${endX}px, -50%)`;
+
+      // Light up characters one by one in sync with MIDI notes
+      const msPerChar = durationMs / Math.max(1, text.length);
+      for (let i = 0; i < charSpans.length; i++) {
+        const timer = setTimeout(() => {
+          charSpans[i].classList.add('lit');
+        }, i * msPerChar);
+        src.charTimers.push(timer);
+      }
+
+      // After all chars lit, transition to afterglow
+      const doneTimer = setTimeout(() => {
+        for (const span of charSpans) {
+          span.classList.remove('lit');
+          span.classList.add('spent');
+        }
+      }, durationMs + 200);
+      src.charTimers.push(doneTimer);
+
+      // Clean up ticker after it exits the viewport
+      setTimeout(() => {
+        if (ticker.parentNode) ticker.remove();
+      }, scrollDuration + 500);
+
+      // Garbage collect old tickers that have already scrolled off
+      const tickers = container.querySelectorAll('.ch-ticker');
+      if (tickers.length > 6) {
+        tickers[0].remove();
+      }
+    }
+
+    function flashBass(midiNote) {
+      flashChannelLabel('bass');
+      const src = getSourceLane('bass', 'engine');
+      src.noteFlash.textContent = midiNoteName(midiNote);
+      src.lane.style.background = '#0a080a';
+      setTimeout(() => {
+        src.lane.style.background = '';
+        setTimeout(() => { src.noteFlash.textContent = ''; }, 150);
+      }, 50);
+    }
+
+    function flashDrum(percType) {
+      flashChannelLabel('drums');
+      const src = getSourceLane('drums', 'engine');
+      src.noteFlash.textContent = percType.toUpperCase();
+      src.lane.style.background = '#0a0a08';
+      setTimeout(() => {
+        src.lane.style.background = '';
+        setTimeout(() => { src.noteFlash.textContent = ''; }, 150);
+      }, 50);
+    }
+
+    function midiNoteName(midi) {
+      const names = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+      return names[midi % 12] + (Math.floor(midi / 12) - 1);
+    }
+  </script>
+</body>
+</html>

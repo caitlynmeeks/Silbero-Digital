@@ -54,11 +54,136 @@ function shouldPlay(terminalId) {
   return true;
 }
 
+// ---- Clip State (per swim lane) ----
+let clipIdCounter = 0;
+const clips = {}; // clipId -> { samples, text, durationMs, sourceId, channel, live, looping, loopTimer }
+
+function createClip(sourceId, samples, text, durationMs) {
+  const id = ++clipIdCounter;
+  clips[id] = {
+    sourceId,
+    samples,
+    text,
+    durationMs,
+    channel: midi.getTerminalChannel(sourceId),
+    live: false,
+    looping: false,
+    loopTimer: null,
+  };
+  return id;
+}
+
+function triggerClip(clipId) {
+  const clip = clips[clipId];
+  if (!clip) return;
+  const savedCh = midi.getTerminalChannel(clip.sourceId);
+  midi.setTerminalChannel(clip.sourceId, clip.channel);
+  playAudioSamples(clip.samples);
+  midi.sendMelodyMIDI(clip.sourceId, clip.text, clip.durationMs, getFreq, PUNCT_PERC);
+  broadcastNote(clip.channel, clip.text, clip.durationMs, clip.sourceId);
+  midi.setTerminalChannel(clip.sourceId, savedCh);
+}
+
+function startClipLoop(clipId) {
+  const clip = clips[clipId];
+  if (!clip || clip.looping) return;
+  clip.looping = true;
+
+  // Use worker-based interval for background-safe timing
+  workerInterval('clip_' + clipId, () => {
+    if (!clip.looping) return;
+    const savedCh = midi.getTerminalChannel(clip.sourceId);
+    midi.setTerminalChannel(clip.sourceId, clip.channel);
+    if (clip.live) {
+      playAudioSamples(clip.samples);
+    }
+    midi.sendMelodyMIDI(clip.sourceId, clip.text, clip.durationMs, getFreq, PUNCT_PERC);
+    broadcastNote(clip.channel, clip.text, clip.durationMs, clip.sourceId);
+    midi.setTerminalChannel(clip.sourceId, savedCh);
+  }, clip.durationMs);
+
+  // Also fire immediately on first tick
+  triggerClip(clipId);
+}
+
+function stopClipLoop(clipId) {
+  const clip = clips[clipId];
+  if (!clip) return;
+  clip.looping = false;
+  workerClearInterval('clip_' + clipId);
+  vizChannel.postMessage({ type: 'stop', channel: clip.channel, sourceId: clip.sourceId });
+}
+
+// ---- Channel Visualization Broadcast ----
+// Sends events to the channel-viz window via BroadcastChannel.
+const vizChannel = new BroadcastChannel('silbero-viz');
+
+function broadcastNote(channel, text, durationMs, sourceId) {
+  vizChannel.postMessage({
+    type: 'note',
+    channel,
+    text,
+    durationMs,
+    sourceId,
+    name: clientInfo[sourceId]?.name || `TF${sourceId}`,
+    time: Date.now(),
+  });
+
+  // Also send per-character tick events so the channel label can flash per note
+  const msPerChar = durationMs / Math.max(1, text.length);
+  for (let i = 0; i < text.length; i++) {
+    setTimeout(() => {
+      vizChannel.postMessage({ type: 'tick', channel, time: Date.now() });
+    }, i * msPerChar);
+  }
+}
+
+function broadcastBassNote(midiNote, durationMs) {
+  vizChannel.postMessage({ type: 'bass', midiNote, durationMs, time: Date.now() });
+}
+
+function broadcastDrum(percType) {
+  vizChannel.postMessage({ type: 'drum', percType, time: Date.now() });
+}
+
+// ---- Timer Worker ----
+// Web Workers are NOT throttled when the tab loses focus. This is critical
+// for keeping the sequencer running at full speed while the operator works
+// in Logic Pro. Every timing-sensitive loop uses this instead of setInterval.
+const timerWorker = new Worker(URL.createObjectURL(new Blob([`
+  const timers = {};
+  self.onmessage = (e) => {
+    const { id, cmd, ms } = e.data;
+    if (cmd === 'start') {
+      if (timers[id]) clearInterval(timers[id]);
+      timers[id] = setInterval(() => self.postMessage(id), ms || 25);
+    } else if (cmd === 'stop') {
+      if (timers[id]) { clearInterval(timers[id]); delete timers[id]; }
+    }
+  };
+`], { type: 'text/javascript' })));
+
+const workerCallbacks = {};
+timerWorker.onmessage = (e) => {
+  const cb = workerCallbacks[e.data];
+  if (cb) cb();
+};
+
+function workerInterval(id, callback, ms) {
+  workerCallbacks[id] = callback;
+  timerWorker.postMessage({ id, cmd: 'start', ms });
+}
+
+function workerClearInterval(id) {
+  timerWorker.postMessage({ id, cmd: 'stop' });
+  delete workerCallbacks[id];
+}
+
 // ---- Psytrance Bass Engine ----
 //
-// Continuous backing track that runs on the AudioContext using the canonical
-// Web Audio precision scheduler: a 25ms JS interval looks 100ms ahead and
-// schedules notes via audioCtx.currentTime, so timing is sample-accurate.
+// Continuous backing track on the AudioContext. Uses the Worker timer
+// so it keeps running at full speed even when the browser tab is in
+// the background (operator working in Logic Pro).
 //
 // Patterns:
 //   - psy:    classic "rest, on, on, on" 16th note pattern (psytrance)
@@ -100,15 +225,12 @@ function startBassEngine() {
   bassEngine.nextNoteTime = audioCtx.currentTime + 0.05;
   bassEngine.step = 0;
   scheduleAhead();
-  bassEngine.scheduleTimer = setInterval(scheduleAhead, 25);
+  workerInterval('bass', scheduleAhead, 25);
 }
 
 function stopBassEngine() {
   bassEngine.enabled = false;
-  if (bassEngine.scheduleTimer) {
-    clearInterval(bassEngine.scheduleTimer);
-    bassEngine.scheduleTimer = null;
-  }
+  workerClearInterval('bass');
 }
 
 function scheduleAhead() {
@@ -137,8 +259,9 @@ function scheduleAhead() {
  * a punchy amp envelope. The classic plucky-deep psytrance signature.
  */
 function playBassNote(when, duration, midiNote) {
-  // MIDI output: send bass note to channel 9
+  // MIDI output + viz broadcast
   midi.sendBassNoteMIDI(midiNote, duration * 1000, 100);
+  broadcastBassNote(midiNote, duration * 1000);
 
   // Skip internal audio if muted
   if (internalMuted) return;
@@ -194,6 +317,11 @@ const elPrinterStatus = document.getElementById('op-printer-status');
 
 function init() {
   elBtnPrinter.addEventListener('click', connectPrinter);
+
+  // Channel visualization window
+  document.getElementById('btn-viz').addEventListener('click', () => {
+    window.open('/channels.html', 'silbero-viz', 'width=1920,height=400,menubar=no,toolbar=no');
+  });
 
   document.getElementById('btn-disconnect-all').addEventListener('click', () => {
     if (ws && ws.readyState === 1) {
@@ -944,30 +1072,32 @@ function startLoop(terminalId) {
   if (!mx.lastSamples) return;
   mx.looping = true;
 
-  function tick() {
+  workerInterval('loop_' + terminalId, () => {
     if (!mx.looping) return;
     if (shouldPlay(terminalId)) {
       playAudioSamples(mx.lastSamples);
     }
-    // MIDI loop: replay the melody notes
     if (mx.lastText) {
       midi.sendMelodyMIDI(terminalId, mx.lastText, mx.lastDurationMs, getFreq, PUNCT_PERC);
+      broadcastNote(midi.getTerminalChannel(terminalId), mx.lastText, mx.lastDurationMs, terminalId);
     }
-    mx.loopTimer = setTimeout(tick, mx.lastDurationMs);
+  }, mx.lastDurationMs);
+
+  // Fire immediately
+  if (shouldPlay(terminalId)) playAudioSamples(mx.lastSamples);
+  if (mx.lastText) {
+    midi.sendMelodyMIDI(terminalId, mx.lastText, mx.lastDurationMs, getFreq, PUNCT_PERC);
+    broadcastNote(midi.getTerminalChannel(terminalId), mx.lastText, mx.lastDurationMs, terminalId);
   }
-  tick();
 }
 
 function stopLoop(terminalId) {
   const mx = getMixer(terminalId);
   mx.looping = false;
-  if (mx.loopTimer) {
-    clearTimeout(mx.loopTimer);
-    mx.loopTimer = null;
-  }
-  // Update button state
+  workerClearInterval('loop_' + terminalId);
   const btn = document.querySelector(`.mixer-controls[data-terminal="${terminalId}"] [data-action="loop"]`);
   if (btn) btn.classList.remove('active');
+  vizChannel.postMessage({ type: 'stop', channel: midi.getTerminalChannel(terminalId), sourceId: terminalId });
 }
 
 // ---- Quantize Engine ----
@@ -1015,11 +1145,12 @@ function handleTextMessage(msg) {
       }
       // MIDI output: send melody notes to this terminal's channel
       midi.sendMelodyMIDI(sourceId, text, durationMs, getFreq, PUNCT_PERC);
+      broadcastNote(midi.getTerminalChannel(sourceId), text, durationMs, sourceId);
     }, audioCtx);
   }
 
-  // Create swim lane
-  const lane = createLane(sourceId);
+  // Create swim lane with clip controls
+  const lane = createLane(sourceId, null, { samples: silboAudio, text, durationMs });
   const body = lane.querySelector('.op-lane-body');
 
   // Waveform
@@ -1122,25 +1253,110 @@ function addEventLane(terminalId, eventType, name) {
   }, 30000);
 }
 
-function createLane(sourceId, type) {
+/**
+ * Create a swim lane. If samples/text/duration are provided, the lane
+ * becomes a triggerable clip with LIVE/CH/LOOP controls.
+ */
+function createLane(sourceId, type, clipData) {
   const lane = document.createElement('div');
   lane.className = `op-lane${type ? ' ' + type : ''}`;
 
-  // Face thumbnail
-  const faceCanvas = document.createElement('canvas');
-  faceCanvas.className = 'op-lane-face';
-  faceCanvas.width = 48;
-  faceCanvas.height = 48;
-  const faceCtx = faceCanvas.getContext('2d');
+  // Left column: clip controls (if this is a message lane) or face thumbnail
+  if (clipData) {
+    const clipId = createClip(sourceId, clipData.samples, clipData.text, clipData.durationMs);
+    lane.dataset.clipId = clipId;
 
-  if (latestFaces[sourceId]) {
-    faceCtx.drawImage(latestFaces[sourceId], 0, 0, 48, 48);
-    const fa = faceAnalysis[sourceId];
-    if (fa && fa.faces && fa.faces[0]) {
-      drawFaceAnnotations(faceCtx, fa.faces[0], fa.imageWidth, fa.imageHeight, 48, 48);
+    const controls = document.createElement('div');
+    controls.className = 'clip-controls';
+
+    const btnLive = document.createElement('button');
+    btnLive.className = 'clip-btn clip-live';
+    btnLive.textContent = 'LIVE';
+    btnLive.title = 'Toggle live (Cmd+click lane to trigger)';
+
+    const chSelect = document.createElement('select');
+    chSelect.className = 'clip-ch';
+    chSelect.title = 'MIDI channel';
+    for (let n = 1; n <= 8; n++) {
+      const opt = document.createElement('option');
+      opt.value = n - 1;
+      opt.textContent = n;
+      if (n - 1 === clips[clipId].channel) opt.selected = true;
+      chSelect.appendChild(opt);
     }
+
+    const btnLoop = document.createElement('button');
+    btnLoop.className = 'clip-btn clip-loop';
+    btnLoop.textContent = 'LOOP';
+
+    // Wire controls
+    btnLive.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const clip = clips[clipId];
+      clip.live = !clip.live;
+      btnLive.classList.toggle('active', clip.live);
+      lane.classList.toggle('clip-live-on', clip.live);
+    });
+
+    chSelect.addEventListener('click', (e) => e.stopPropagation());
+    chSelect.addEventListener('change', (e) => {
+      const clip = clips[clipId];
+      clip.channel = parseInt(e.target.value, 10);
+      // Override the terminal channel for this clip's MIDI output
+      midi.setTerminalChannel(sourceId + '_clip' + clipId, clip.channel);
+    });
+
+    btnLoop.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const clip = clips[clipId];
+      if (clip.looping) {
+        stopClipLoop(clipId);
+        btnLoop.classList.remove('active');
+      } else {
+        clip.live = true;
+        btnLive.classList.add('active');
+        lane.classList.add('clip-live-on');
+        startClipLoop(clipId);
+        btnLoop.classList.add('active');
+      }
+    });
+
+    // Cmd+click on lane = trigger this clip
+    lane.addEventListener('click', (e) => {
+      if (e.metaKey || e.ctrlKey) {
+        e.preventDefault();
+        const clip = clips[clipId];
+        clip.live = true;
+        btnLive.classList.add('active');
+        lane.classList.add('clip-live-on');
+        triggerClip(clipId);
+        // Flash the lane
+        lane.classList.add('clip-triggered');
+        setTimeout(() => lane.classList.remove('clip-triggered'), 300);
+      }
+    });
+
+    controls.appendChild(btnLive);
+    controls.appendChild(chSelect);
+    controls.appendChild(btnLoop);
+    lane.appendChild(controls);
   } else {
-    drawUnknownUser(faceCtx, 48, 48);
+    // Non-message lanes (dossier, event): just show face
+    const faceCanvas = document.createElement('canvas');
+    faceCanvas.className = 'op-lane-face';
+    faceCanvas.width = 48;
+    faceCanvas.height = 48;
+    const faceCtx = faceCanvas.getContext('2d');
+    if (latestFaces[sourceId]) {
+      faceCtx.drawImage(latestFaces[sourceId], 0, 0, 48, 48);
+      const fa2 = faceAnalysis[sourceId];
+      if (fa2 && fa2.faces && fa2.faces[0]) {
+        drawFaceAnnotations(faceCtx, fa2.faces[0], fa2.imageWidth, fa2.imageHeight, 48, 48);
+      }
+    } else {
+      drawUnknownUser(faceCtx, 48, 48);
+    }
+    lane.appendChild(faceCanvas);
   }
 
   const body = document.createElement('div');
@@ -1161,7 +1377,7 @@ function createLane(sourceId, type) {
   header.appendChild(idSpan);
   header.appendChild(timeSpan);
 
-  // Add face analysis summary to header if available
+  // Face analysis summary tag
   const fa = faceAnalysis[sourceId];
   if (fa && fa.faces && fa.faces[0]) {
     const f = fa.faces[0];
@@ -1172,7 +1388,6 @@ function createLane(sourceId, type) {
   }
 
   body.appendChild(header);
-  lane.appendChild(faceCanvas);
   lane.appendChild(body);
 
   elLanes.insertBefore(lane, elLanes.firstChild);

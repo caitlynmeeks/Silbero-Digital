@@ -408,6 +408,87 @@ body {
   min-width: 0;
 }
 
+/* Clip controls column (replaces face thumbnail on message lanes) */
+.clip-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex-shrink: 0;
+  width: 42px;
+}
+
+.clip-btn {
+  display: block;
+  width: 100%;
+  padding: 3px 0;
+  background: #0a0a0a;
+  border: 1px solid #1a1a1a;
+  color: #333;
+  font-family: inherit;
+  font-size: 8px;
+  font-weight: bold;
+  letter-spacing: 1px;
+  cursor: pointer;
+  text-align: center;
+  transition: all 0.1s;
+}
+
+.clip-btn:hover {
+  background: #111;
+  color: #555;
+  border-color: #333;
+}
+
+.clip-live.active {
+  color: #f44;
+  border-color: #633;
+  background: #1a0a0a;
+  animation: livePulse 1s ease-in-out infinite;
+}
+
+@keyframes livePulse {
+  0%, 100% { border-color: #633; }
+  50%      { border-color: #a44; }
+}
+
+.clip-loop.active {
+  color: #6f6;
+  border-color: #4a4;
+  background: #0a1a0a;
+}
+
+.clip-ch {
+  width: 100%;
+  padding: 2px 0;
+  background: #0a0a0a;
+  border: 1px solid #1a1a1a;
+  color: #4c8;
+  font-family: inherit;
+  font-size: 9px;
+  font-weight: bold;
+  text-align: center;
+  cursor: pointer;
+}
+
+.clip-ch:hover { border-color: #3a6; }
+.clip-ch:focus { outline: none; border-color: #4c8; }
+
+/* Lane with live clip */
+.op-lane.clip-live-on {
+  border-left: 2px solid #a33;
+}
+
+/* Flash when triggered */
+.op-lane.clip-triggered {
+  background: #1a1010 !important;
+  transition: none;
+}
+
+/* Cmd+click cursor hint */
+.op-lane[data-clip-id] {
+  cursor: default;
+}
+
 /* Event lanes (connect/disconnect/message indicators) */
 .op-lane.event {
   padding: 3px 6px;
