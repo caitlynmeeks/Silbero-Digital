@@ -493,27 +493,13 @@ export function synthesizeSilbo(text, waveformOrProfile = 'sine') {
     let targetGain = getGain(char);
     let duration = getDuration(char, bpm);
 
-    // Space: render as a soft E major power chord — anchors the listener in E
-    if (char === ' ') {
-      const chordSamples = Math.floor(duration * SAMPLE_RATE);
-      const chordPhases = E_CHORD.map(() => 0);
-
-      for (let i = 0; i < chordSamples && sampleIdx < totalSamples; i++) {
-        const t = i / chordSamples;
-        // Soft attack/release envelope so chord doesn't click
-        const env = Math.sin(t * Math.PI) * 0.18;
-
-        let chordSample = 0;
-        for (let n = 0; n < E_CHORD.length; n++) {
-          const f = E_CHORD[n] * pitchShift;
-          chordPhases[n] += (2 * Math.PI * f) / SAMPLE_RATE;
-          chordSample += Math.sin(chordPhases[n]) * env;
-        }
-
-        // Update tonal state so the next melodic note glides smoothly out of E
-        currentFreq = E_CHORD[0] * pitchShift;
-        currentGain *= 0.95;
-        samples[sampleIdx] = chordSample / E_CHORD.length;
+    // Whitespace: silent rest (keeps timing gap, no sound)
+    if (char === ' ' || char === '\t' || char === '\n' || char === '\r') {
+      const restSamples = Math.floor(duration * SAMPLE_RATE);
+      currentGain *= 0.5; // fade toward silence
+      for (let i = 0; i < restSamples && sampleIdx < totalSamples; i++) {
+        currentGain *= 0.998;
+        samples[sampleIdx] = 0;
         sampleIdx++;
       }
       continue;

@@ -366,13 +366,8 @@ export function sendMelodyMIDI(terminalId, text, durationMs, getCharFreq, punctP
   for (const char of text) {
     const delay = offset;
 
-    if (char === ' ') {
-      // Space chord: E4 + B4 + E5 on the chord channel
-      setTimeout(() => {
-        sendMicrotonalNote(CH_CHORD, 329.63, 60, msPerChar * 0.8);  // E4
-        sendMicrotonalNote(CH_CHORD, 493.88, 50, msPerChar * 0.8);  // B4
-        sendMicrotonalNote(CH_CHORD, 659.26, 45, msPerChar * 0.8);  // E5
-      }, delay);
+    if (char === ' ' || char === '\t' || char === '\n' || char === '\r') {
+      // Whitespace: silent rest, no MIDI output
     } else if (punctPercMap && punctPercMap[char]) {
       // Percussion on channel 10
       const percType = punctPercMap[char];

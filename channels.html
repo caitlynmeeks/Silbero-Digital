@@ -21,16 +21,16 @@
       display: flex;
       flex-direction: column;
       min-height: 100vh;
-      gap: 1px;
+      gap: 0;
       padding: 2px;
     }
 
+    /* Channel group: permanent base lane + dynamic source lanes */
     .ch-group {
       display: flex;
       flex-direction: column;
       gap: 0;
     }
-    .ch-group:empty { display: none; }
 
     .ch-lane {
       display: flex;
@@ -40,30 +40,30 @@
       border: 1px solid #0a0a0a;
       overflow: hidden;
       position: relative;
-      height: 38px;
+      height: 44px;
       flex-shrink: 0;
     }
 
-    /* Channel label */
+    /* Channel label — always visible, steady appearance */
     .ch-label {
-      width: 48px;
+      width: 52px;
       flex-shrink: 0;
       text-align: center;
       font-size: 10px;
       font-weight: bold;
       letter-spacing: 2px;
-      color: #1a1a1a;
-      border-right: 1px solid #0a0a0a;
+      color: #aaa;
+      border-right: 1px solid #1a1a1a;
       height: 100%;
       display: flex;
       align-items: center;
       justify-content: center;
-      transition: color 0.03s, background 0.03s;
     }
 
-    .ch-label.flash {
-      color: #fff;
-      background: #222;
+    /* Signal active: label text turns green, nothing else changes */
+    .ch-label.signal {
+      color: #0c0;
+      transition: color 0.05s;
     }
 
     /* Holzer scrolling area */
@@ -74,14 +74,12 @@
       overflow: hidden;
     }
 
-    /* Each phrase scrolls left across the viewport like an LED sign.
-       Never clears. New loops start from the right. Multiple phrases
-       can coexist, scrolling at their own pace. */
+    /* Ticker phrase */
     .ch-ticker {
       position: absolute;
       top: 50%;
       white-space: nowrap;
-      font-size: 20px;
+      font-size: 28px;
       letter-spacing: 4px;
       padding: 0 16px;
       will-change: transform;
@@ -89,28 +87,45 @@
 
     .ch-sender {
       color: #222;
-      font-size: 9px;
+      font-size: 11px;
       letter-spacing: 1px;
       margin-right: 6px;
     }
 
-    /* Characters: dim until their note fires, then they glow */
+    /* Characters */
     .ch-char {
       color: #0a0a0a;
+      text-shadow: none;
+      transition: none;
+    }
+
+    .ch-char.hit {
+      color: #fff;
+      text-shadow: 0 0 16px rgba(255,255,255,0.9), 0 0 4px rgba(255,255,255,1);
       transition: none;
     }
 
     .ch-char.lit {
-      color: #ccc;
-      text-shadow: 0 0 10px rgba(255, 255, 255, 0.4);
-      transition: color 0.03s;
+      color: #999;
+      text-shadow: 0 0 6px rgba(255,255,255,0.2);
+      transition: color 0.4s, text-shadow 0.4s;
     }
 
-    /* After the phrase completes, chars dim to a warm afterglow */
     .ch-char.spent {
-      color: #2a2a2a;
+      color: #222;
       text-shadow: none;
-      transition: color 1.5s;
+      transition: color 1.2s, text-shadow 0.6s;
+    }
+
+    /* Muted characters: identical to active, just not bold */
+    .ch-char.muted {
+      color: #0a0a0a;
+    }
+
+    /* Active characters get bold when lit */
+    .ch-char.hit,
+    .ch-char.lit {
+      font-weight: bold;
     }
 
     /* Note flash indicator (bass/drums) */
@@ -119,13 +134,13 @@
       right: 8px;
       top: 50%;
       transform: translateY(-50%);
-      font-size: 9px;
-      color: #333;
+      font-size: 10px;
+      color: #444;
       letter-spacing: 1px;
       z-index: 2;
     }
 
-    /* Channel accent colors — left border */
+    /* Channel accent colors — left border (always visible) */
     .ch-group[data-ch="0"] .ch-lane { border-left: 2px solid #444; }
     .ch-group[data-ch="1"] .ch-lane { border-left: 2px solid #446; }
     .ch-group[data-ch="2"] .ch-lane { border-left: 2px solid #464; }
@@ -137,29 +152,25 @@
     .ch-group[data-ch="bass"] .ch-lane { border-left: 2px solid #636; }
     .ch-group[data-ch="drums"] .ch-lane { border-left: 2px solid #663; }
 
-    /* Per-channel glow colors */
-    .ch-group[data-ch="0"] .ch-char.lit { color: #eee; text-shadow: 0 0 10px rgba(255,255,255,0.4); }
-    .ch-group[data-ch="1"] .ch-char.lit { color: #bbf; text-shadow: 0 0 10px rgba(180,180,255,0.4); }
-    .ch-group[data-ch="2"] .ch-char.lit { color: #bfb; text-shadow: 0 0 10px rgba(180,255,180,0.4); }
-    .ch-group[data-ch="3"] .ch-char.lit { color: #fbb; text-shadow: 0 0 10px rgba(255,180,180,0.4); }
-    .ch-group[data-ch="4"] .ch-char.lit { color: #bff; text-shadow: 0 0 10px rgba(180,255,255,0.4); }
-    .ch-group[data-ch="5"] .ch-char.lit { color: #fbf; text-shadow: 0 0 10px rgba(255,180,255,0.4); }
-    .ch-group[data-ch="6"] .ch-char.lit { color: #ffb; text-shadow: 0 0 10px rgba(255,255,180,0.4); }
-    .ch-group[data-ch="7"] .ch-char.lit { color: #ccc; text-shadow: 0 0 10px rgba(200,200,200,0.4); }
+    /* Per-channel hit flash colors */
+    .ch-group[data-ch="0"] .ch-char.hit { color: #fff; text-shadow: 0 0 18px #fff, 0 0 4px #fff; }
+    .ch-group[data-ch="1"] .ch-char.hit { color: #ddf; text-shadow: 0 0 18px #aaf, 0 0 4px #bbf; }
+    .ch-group[data-ch="2"] .ch-char.hit { color: #dfd; text-shadow: 0 0 18px #afa, 0 0 4px #bfb; }
+    .ch-group[data-ch="3"] .ch-char.hit { color: #fdd; text-shadow: 0 0 18px #faa, 0 0 4px #fbb; }
+    .ch-group[data-ch="4"] .ch-char.hit { color: #dff; text-shadow: 0 0 18px #aff, 0 0 4px #bff; }
+    .ch-group[data-ch="5"] .ch-char.hit { color: #fdf; text-shadow: 0 0 18px #faf, 0 0 4px #fbf; }
+    .ch-group[data-ch="6"] .ch-char.hit { color: #ffd; text-shadow: 0 0 18px #ffa, 0 0 4px #ffb; }
+    .ch-group[data-ch="7"] .ch-char.hit { color: #fff; text-shadow: 0 0 18px #ddd, 0 0 4px #ccc; }
 
-    /* Label flash per channel */
-    .ch-group[data-ch="0"] .ch-label.flash { color: #fff; background: #333; }
-    .ch-group[data-ch="1"] .ch-label.flash { color: #bbf; background: #223; }
-    .ch-group[data-ch="2"] .ch-label.flash { color: #bfb; background: #232; }
-    .ch-group[data-ch="3"] .ch-label.flash { color: #fbb; background: #322; }
-    .ch-group[data-ch="4"] .ch-label.flash { color: #bff; background: #233; }
-    .ch-group[data-ch="5"] .ch-label.flash { color: #fbf; background: #323; }
-    .ch-group[data-ch="6"] .ch-label.flash { color: #ffb; background: #332; }
-    .ch-group[data-ch="7"] .ch-label.flash { color: #ccc; background: #2a2a2a; }
-    .ch-group[data-ch="bass"] .ch-label.flash { color: #c8c; background: #323; }
-    .ch-group[data-ch="drums"] .ch-label.flash { color: #cc8; background: #332; }
-
-    .ch-group .ch-lane:not(:first-child) .ch-label { color: #111; font-size: 8px; }
+    /* Per-channel settled glow colors */
+    .ch-group[data-ch="0"] .ch-char.lit { color: #999; text-shadow: 0 0 6px rgba(255,255,255,0.2); }
+    .ch-group[data-ch="1"] .ch-char.lit { color: #88a; text-shadow: 0 0 6px rgba(140,140,200,0.2); }
+    .ch-group[data-ch="2"] .ch-char.lit { color: #8a8; text-shadow: 0 0 6px rgba(140,200,140,0.2); }
+    .ch-group[data-ch="3"] .ch-char.lit { color: #a88; text-shadow: 0 0 6px rgba(200,140,140,0.2); }
+    .ch-group[data-ch="4"] .ch-char.lit { color: #8aa; text-shadow: 0 0 6px rgba(140,200,200,0.2); }
+    .ch-group[data-ch="5"] .ch-char.lit { color: #a8a; text-shadow: 0 0 6px rgba(200,140,200,0.2); }
+    .ch-group[data-ch="6"] .ch-char.lit { color: #aa8; text-shadow: 0 0 6px rgba(200,200,140,0.2); }
+    .ch-group[data-ch="7"] .ch-char.lit { color: #999; text-shadow: 0 0 6px rgba(180,180,180,0.2); }
 
     /* Scan lines */
     .ch-lane::after {
@@ -188,17 +199,43 @@
       { id: 'bass', label: 'BASS' }, { id: 'drums', label: 'DRUM' },
     ];
 
-    const groups = {};
-    const sources = {};
+    const groups = {};    // chId -> { el, def, baseLane, baseLabel }
+    const sources = {};   // "chId:sourceId" -> { lane, label, scroll, noteFlash, charTimers }
+    const signalTimers = {}; // chId -> timeout for green label
 
+    // Build all channel groups with a permanent base lane
     for (const def of channelDefs) {
       const group = document.createElement('div');
       group.className = 'ch-group';
       group.dataset.ch = def.id;
+
+      // Permanent base lane — always visible
+      const baseLane = document.createElement('div');
+      baseLane.className = 'ch-lane';
+
+      const baseLabel = document.createElement('div');
+      baseLabel.className = 'ch-label';
+      baseLabel.textContent = def.label;
+
+      const baseScroll = document.createElement('div');
+      baseScroll.className = 'ch-scroll';
+
+      const baseFlash = document.createElement('div');
+      baseFlash.className = 'ch-note-flash';
+
+      baseLane.appendChild(baseLabel);
+      baseLane.appendChild(baseScroll);
+      baseLane.appendChild(baseFlash);
+      group.appendChild(baseLane);
       elChannels.appendChild(group);
-      groups[def.id] = { el: group, def };
+
+      groups[def.id] = { el: group, def, baseLane, baseLabel, baseScroll, baseFlash };
     }
 
+    /**
+     * Get or create a source lane for a specific source on a channel.
+     * First source reuses the base lane. Additional sources create new lanes below.
+     */
     function getSourceLane(chId, sourceId) {
       const key = chId + ':' + sourceId;
       if (sources[key]) return sources[key];
@@ -206,6 +243,24 @@
       const group = groups[chId];
       if (!group) return null;
 
+      // Check if the base lane is unclaimed
+      const baseKey = chId + ':__base__';
+      if (!sources[baseKey]) {
+        // First source: use the base lane
+        sources[baseKey] = true; // mark claimed
+        const entry = {
+          lane: group.baseLane,
+          label: group.baseLabel,
+          scroll: group.baseScroll,
+          noteFlash: group.baseFlash,
+          charTimers: [],
+          sourceId,
+        };
+        sources[key] = entry;
+        return entry;
+      }
+
+      // Additional source: create a new lane below
       const lane = document.createElement('div');
       lane.className = 'ch-lane';
 
@@ -224,159 +279,184 @@
       lane.appendChild(noteFlash);
       group.el.appendChild(lane);
 
-      const entry = { lane, label, scroll, noteFlash, charTimers: [] };
+      const entry = { lane, label, scroll, noteFlash, charTimers: [], sourceId, dynamic: true };
       sources[key] = entry;
       return entry;
     }
 
-    function flashChannelLabel(chId) {
+    /**
+     * Turn the channel label text green on signal, revert after 300ms of silence.
+     */
+    function signalChannel(chId) {
       const group = groups[chId];
       if (!group) return;
-      group.el.querySelectorAll('.ch-label').forEach(l => {
-        l.classList.add('flash');
-        setTimeout(() => l.classList.remove('flash'), 50);
-      });
+
+      // Turn ALL labels in this group green
+      group.el.querySelectorAll('.ch-label').forEach(l => l.classList.add('signal'));
+
+      // Clear previous revert timer
+      if (signalTimers[chId]) clearTimeout(signalTimers[chId]);
+
+      // Revert to default after 300ms of no signal
+      signalTimers[chId] = setTimeout(() => {
+        group.el.querySelectorAll('.ch-label').forEach(l => l.classList.remove('signal'));
+      }, 300);
     }
 
+    // Listen for events from the operator console
     const bc = new BroadcastChannel('silbero-viz');
 
     bc.onmessage = (e) => {
       const msg = e.data;
       switch (msg.type) {
         case 'note':
-          holzerScroll(String(msg.channel), String(msg.sourceId), msg.text, msg.durationMs, msg.name);
+          holzerScroll(String(msg.channel), String(msg.sourceId),
+            msg.displayText || msg.text, msg.activeText || msg.text,
+            msg.durationMs, msg.name);
           break;
         case 'tick':
-          flashChannelLabel(String(msg.channel));
+          signalChannel(String(msg.channel));
           break;
         case 'bass':
-          flashBass(msg.midiNote);
+          signalChannel('bass');
+          flashNote('bass', 'engine', midiNoteName(msg.midiNote));
           break;
         case 'drum':
-          flashDrum(msg.percType);
+          signalChannel('drums');
+          flashNote('drums', 'engine', msg.percType.toUpperCase());
           break;
         case 'stop':
-          // Don't clear -- let existing text finish scrolling and fade naturally
+          stopSource(String(msg.channel), String(msg.sourceId));
           break;
       }
     };
 
     /**
-     * Holzer scroll: text enters from the right, scrolls left across the
-     * viewport as each character's MIDI note fires and lights up. When the
-     * phrase is complete, characters dim to an afterglow. On loop restart,
-     * a new ticker starts from the right -- the old one keeps scrolling left
-     * and eventually exits. Multiple phrases can coexist, overlapping.
-     *
-     * The text never clears. The lane is never blank. Like a Jenny Holzer
-     * LED installation in Times Square.
+     * Flash a note name in a source lane (bass/drums).
      */
-    function holzerScroll(chId, sourceId, text, durationMs, senderName) {
+    function flashNote(chId, sourceId, label) {
+      const src = getSourceLane(chId, sourceId);
+      if (!src) return;
+      src.noteFlash.textContent = label;
+      setTimeout(() => { src.noteFlash.textContent = ''; }, 200);
+    }
+
+    /**
+     * Holzer scroll: text enters right, scrolls left, characters flash
+     * as their MIDI note fires. Never clears. Loops overlap.
+     */
+    /**
+     * @param {string} displayText - Full original text (always shown for readability)
+     * @param {string} activeText  - Thinned text after density (which chars trigger notes)
+     */
+    function holzerScroll(chId, sourceId, displayText, activeText, durationMs, senderName) {
       const src = getSourceLane(chId, sourceId);
       if (!src) return;
 
-      // Cancel any pending character timers from a previous iteration
-      // (but don't remove existing tickers -- they keep scrolling)
       for (const t of src.charTimers) clearTimeout(t);
       src.charTimers = [];
 
       const container = src.scroll;
       const containerWidth = container.offsetWidth || 800;
 
-      // Build ticker element
+      // Build ticker with ALL characters visible
       const ticker = document.createElement('div');
       ticker.className = 'ch-ticker';
 
-      // Sender tag (dim, small)
       const tag = document.createElement('span');
       tag.className = 'ch-sender';
       tag.textContent = senderName;
       ticker.appendChild(tag);
 
-      // Pre-render all characters dim
+      // Render every character from displayText.
+      // Mark each as 'active' or 'muted' based on whether activeText
+      // has a non-space character at that position.
       const charSpans = [];
-      for (const ch of text) {
+      for (let i = 0; i < displayText.length; i++) {
         const span = document.createElement('span');
-        span.className = 'ch-char';
-        span.textContent = ch;
+        const isActive = activeText[i] && activeText[i] !== ' ' && displayText[i] !== ' ';
+        span.className = isActive ? 'ch-char' : 'ch-char muted';
+        span.textContent = displayText[i];
         ticker.appendChild(span);
-        charSpans.push(span);
+        charSpans.push({ span, active: isActive });
       }
 
       container.appendChild(ticker);
 
-      // Measure text width after DOM insertion
-      const textWidth = ticker.offsetWidth || (text.length * 20);
-
-      // Scroll: start from right edge, scroll left across viewport + text width
-      // Speed: the phrase should be centered in the viewport at the midpoint
-      // of its duration, so total scroll distance = containerWidth + textWidth
-      const totalDistance = containerWidth + textWidth;
-      const scrollDuration = durationMs * 1.5; // scroll a bit slower than the typing
-
-      // Start position: just off the right edge
+      const textWidth = ticker.offsetWidth || (displayText.length * 24);
+      const scrollDuration = durationMs * 1.5;
       const startX = containerWidth;
       const endX = -textWidth;
 
-      // Set start position, force layout flush, THEN add transition.
-      // This avoids requestAnimationFrame which Chrome throttles in
-      // unfocused windows, causing the start position to be missed.
       ticker.style.transition = 'none';
       ticker.style.transform = `translate(${startX}px, -50%)`;
-      ticker.offsetWidth; // force synchronous layout flush
+      ticker.offsetWidth;
       ticker.style.transition = `transform ${scrollDuration}ms linear`;
       ticker.style.transform = `translate(${endX}px, -50%)`;
 
-      // Light up characters one by one in sync with MIDI notes
-      const msPerChar = durationMs / Math.max(1, text.length);
+      // Light up characters in sequence — active ones flash,
+      // muted ones get the same colors (just have strikethrough)
+      const msPerChar = durationMs / Math.max(1, displayText.length);
       for (let i = 0; i < charSpans.length; i++) {
+        const { span, active } = charSpans[i];
         const timer = setTimeout(() => {
-          charSpans[i].classList.add('lit');
+          if (active) {
+            // Active: bright flash then glow
+            span.classList.add('hit');
+            setTimeout(() => {
+              span.classList.remove('hit');
+              span.classList.add('lit');
+            }, 60);
+          } else {
+            // Muted: same color progression, no flash — just appear as lit
+            span.classList.add('lit');
+          }
         }, i * msPerChar);
         src.charTimers.push(timer);
       }
 
-      // After all chars lit, transition to afterglow
+      // Afterglow
       const doneTimer = setTimeout(() => {
-        for (const span of charSpans) {
-          span.classList.remove('lit');
+        for (const { span } of charSpans) {
+          span.classList.remove('lit', 'hit');
           span.classList.add('spent');
         }
       }, durationMs + 200);
       src.charTimers.push(doneTimer);
 
-      // Clean up ticker after it exits the viewport
       setTimeout(() => {
         if (ticker.parentNode) ticker.remove();
       }, scrollDuration + 500);
 
-      // Garbage collect old tickers that have already scrolled off
       const tickers = container.querySelectorAll('.ch-ticker');
-      if (tickers.length > 6) {
-        tickers[0].remove();
+      if (tickers.length > 6) tickers[0].remove();
+    }
+
+    /**
+     * Stop a source — fade out and optionally remove dynamic lane.
+     */
+    function stopSource(chId, sourceId) {
+      const key = chId + ':' + sourceId;
+      const src = sources[key];
+      if (!src) return;
+
+      for (const t of src.charTimers) clearTimeout(t);
+      src.charTimers = [];
+
+      // Fade existing text
+      const phrase = src.scroll.querySelector('.ch-ticker');
+      if (phrase) {
+        phrase.classList.add('fading');
+        setTimeout(() => { src.scroll.innerHTML = ''; }, 1200);
       }
-    }
 
-    function flashBass(midiNote) {
-      flashChannelLabel('bass');
-      const src = getSourceLane('bass', 'engine');
-      src.noteFlash.textContent = midiNoteName(midiNote);
-      src.lane.style.background = '#0a080a';
-      setTimeout(() => {
-        src.lane.style.background = '';
-        setTimeout(() => { src.noteFlash.textContent = ''; }, 150);
-      }, 50);
-    }
-
-    function flashDrum(percType) {
-      flashChannelLabel('drums');
-      const src = getSourceLane('drums', 'engine');
-      src.noteFlash.textContent = percType.toUpperCase();
-      src.lane.style.background = '#0a0a08';
-      setTimeout(() => {
-        src.lane.style.background = '';
-        setTimeout(() => { src.noteFlash.textContent = ''; }, 150);
-      }, 50);
+      // Remove dynamic (extra) lanes after content clears, but keep the base
+      if (src.dynamic) {
+        setTimeout(() => {
+          if (src.lane.parentNode) src.lane.remove();
+          delete sources[key];
+        }, 2000);
+      }
     }
 
     function midiNoteName(midi) {

@@ -54,18 +54,130 @@ function shouldPlay(terminalId) {
   return true;
 }
 
+// ---- Euclidean Rhythm Engine ----
+//
+// Bjorklund's algorithm: distribute K pulses as evenly as possible
+// across N steps. Produces the rhythmic patterns found in West African
+// bell patterns, Cuban tresillo, bossa nova, and most world music.
+//
+// E(3,8)  = [1,0,0,1,0,0,1,0]  — Cuban tresillo
+// E(5,8)  = [1,0,1,1,0,1,1,0]  — Cuban cinquillo
+// E(5,12) = [1,0,0,1,0,1,0,0,1,0,1,0] — Bembé bell
+// E(7,12) = [1,0,1,1,0,1,0,1,1,0,1,0] — West African bell
+// E(5,16) = [1,0,0,1,0,0,1,0,0,1,0,0,1,0,0,0] — Bossa nova
+
+function bjorklund(pulses, steps) {
+  if (pulses >= steps) return new Array(steps).fill(1);
+  if (pulses <= 0) return new Array(steps).fill(0);
+
+  let pattern = [];
+  for (let i = 0; i < steps; i++) {
+    pattern.push(i < pulses ? [1] : [0]);
+  }
+
+  let level = 0;
+  while (true) {
+    let counts = 0;
+    const newPattern = [];
+    let i = 0;
+    let j = pattern.length - 1;
+
+    while (i < j && pattern[j][0] !== pattern[i][0]) {
+      newPattern.push(pattern[i].concat(pattern[j]));
+      i++;
+      j--;
+      counts++;
+    }
+
+    if (counts <= 1) break;
+
+    // Append remaining unmatched elements
+    while (i <= j) {
+      newPattern.push(pattern[i]);
+      i++;
+    }
+    pattern = newPattern;
+    level++;
+  }
+
+  return pattern.flat();
+}
+
+/**
+ * Density presets. Each returns a boolean mask for the given step count.
+ *   'all'  — every step plays
+ *   '1/2'  — every other step
+ *   '1/3'  — every third step
+ *   '1/4'  — every fourth step
+ *   'e3'   — Euclidean 3 of N
+ *   'e5'   — Euclidean 5 of N
+ *   'e7'   — Euclidean 7 of N
+ *   'e9'   — Euclidean 9 of N
+ *   'e11'  — Euclidean 11 of N
+ */
+function getDensityMask(preset, stepCount) {
+  if (preset === 'all' || !preset) return new Array(stepCount).fill(true);
+
+  // Simple divisors
+  const divMatch = preset.match(/^1\/(\d+)$/);
+  if (divMatch) {
+    const div = parseInt(divMatch[1]);
+    return Array.from({ length: stepCount }, (_, i) => i % div === 0);
+  }
+
+  // Euclidean
+  const eucMatch = preset.match(/^e(\d+)$/);
+  if (eucMatch) {
+    const pulses = Math.min(parseInt(eucMatch[1]), stepCount);
+    const pattern = bjorklund(pulses, stepCount);
+    return pattern.map(v => v === 1);
+  }
+
+  return new Array(stepCount).fill(true);
+}
+
+/**
+ * Apply a density mask to text: replace masked-out characters with spaces.
+ * Preserves existing spaces (they stay as rests regardless).
+ */
+function applyDensity(text, preset) {
+  if (preset === 'all' || !preset) return text;
+
+  // Count only non-space characters for the mask
+  const chars = [];
+  const indices = [];
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== ' ') {
+      chars.push(text[i]);
+      indices.push(i);
+    }
+  }
+
+  const mask = getDensityMask(preset, chars.length);
+  const result = text.split('');
+
+  for (let i = 0; i < chars.length; i++) {
+    if (!mask[i]) {
+      result[indices[i]] = ' '; // rest
+    }
+  }
+
+  return result.join('');
+}
+
 // ---- Clip State (per swim lane) ----
 let clipIdCounter = 0;
-const clips = {}; // clipId -> { samples, text, durationMs, sourceId, channel, live, looping, loopTimer }
+const clips = {};
 
 function createClip(sourceId, samples, text, durationMs) {
   const id = ++clipIdCounter;
   clips[id] = {
     sourceId,
     samples,
-    text,
+    text,           // original text
     durationMs,
     channel: midi.getTerminalChannel(sourceId),
+    density: 'all', // density preset
     live: false,
     looping: false,
     loopTimer: null,
@@ -73,14 +185,33 @@ function createClip(sourceId, samples, text, durationMs) {
   return id;
 }
 
+/**
+ * Re-synthesize a clip with its current density setting.
+ */
+function resynthClip(clipId) {
+  const clip = clips[clipId];
+  if (!clip) return;
+
+  const thinnedText = applyDensity(clip.text, clip.density);
+  const fa = faceAnalysis[clip.sourceId];
+  const voiceProfile = (fa && fa.faces && fa.faces[0])
+    ? deriveVoiceProfile(fa.faces[0])
+    : getWaveform(clip.sourceId);
+
+  const { samples, durationMs } = synthesizeSilbo(thinnedText, voiceProfile);
+  clip.samples = samples;
+  clip.durationMs = durationMs;
+}
+
 function triggerClip(clipId) {
   const clip = clips[clipId];
   if (!clip) return;
+  const thinnedText = applyDensity(clip.text, clip.density);
   const savedCh = midi.getTerminalChannel(clip.sourceId);
   midi.setTerminalChannel(clip.sourceId, clip.channel);
   playAudioSamples(clip.samples);
-  midi.sendMelodyMIDI(clip.sourceId, clip.text, clip.durationMs, getFreq, PUNCT_PERC);
-  broadcastNote(clip.channel, clip.text, clip.durationMs, clip.sourceId);
+  midi.sendMelodyMIDI(clip.sourceId, thinnedText, clip.durationMs, getFreq, PUNCT_PERC);
+  broadcastNote(clip.channel, clip.text, thinnedText, clip.durationMs, clip.sourceId);
   midi.setTerminalChannel(clip.sourceId, savedCh);
 }
 
@@ -92,13 +223,14 @@ function startClipLoop(clipId) {
   // Use worker-based interval for background-safe timing
   workerInterval('clip_' + clipId, () => {
     if (!clip.looping) return;
+    const thinnedText = applyDensity(clip.text, clip.density);
     const savedCh = midi.getTerminalChannel(clip.sourceId);
     midi.setTerminalChannel(clip.sourceId, clip.channel);
     if (clip.live) {
       playAudioSamples(clip.samples);
     }
-    midi.sendMelodyMIDI(clip.sourceId, clip.text, clip.durationMs, getFreq, PUNCT_PERC);
-    broadcastNote(clip.channel, clip.text, clip.durationMs, clip.sourceId);
+    midi.sendMelodyMIDI(clip.sourceId, thinnedText, clip.durationMs, getFreq, PUNCT_PERC);
+    broadcastNote(clip.channel, clip.text, thinnedText, clip.durationMs, clip.sourceId);
     midi.setTerminalChannel(clip.sourceId, savedCh);
   }, clip.durationMs);
 
@@ -118,23 +250,34 @@ function stopClipLoop(clipId) {
 // Sends events to the channel-viz window via BroadcastChannel.
 const vizChannel = new BroadcastChannel('silbero-viz');
 
-function broadcastNote(channel, text, durationMs, sourceId) {
+/**
+ * Broadcast a note event to the VIZ window.
+ * @param {number} channel
+ * @param {string} displayText - Full original text (for readability)
+ * @param {string} activeText - Thinned text after density (which chars trigger)
+ * @param {number} durationMs
+ * @param {number} sourceId
+ */
+function broadcastNote(channel, displayText, activeText, durationMs, sourceId) {
   vizChannel.postMessage({
     type: 'note',
     channel,
-    text,
+    displayText,
+    activeText,
     durationMs,
     sourceId,
     name: clientInfo[sourceId]?.name || `TF${sourceId}`,
     time: Date.now(),
   });
 
-  // Also send per-character tick events so the channel label can flash per note
-  const msPerChar = durationMs / Math.max(1, text.length);
-  for (let i = 0; i < text.length; i++) {
-    setTimeout(() => {
-      vizChannel.postMessage({ type: 'tick', channel, time: Date.now() });
-    }, i * msPerChar);
+  // Per-character tick events for channel label flash (only for active chars)
+  const msPerChar = durationMs / Math.max(1, displayText.length);
+  for (let i = 0; i < displayText.length; i++) {
+    if (activeText[i] && activeText[i] !== ' ') {
+      setTimeout(() => {
+        vizChannel.postMessage({ type: 'tick', channel, time: Date.now() });
+      }, i * msPerChar);
+    }
   }
 }
 
@@ -1079,7 +1222,7 @@ function startLoop(terminalId) {
     }
     if (mx.lastText) {
       midi.sendMelodyMIDI(terminalId, mx.lastText, mx.lastDurationMs, getFreq, PUNCT_PERC);
-      broadcastNote(midi.getTerminalChannel(terminalId), mx.lastText, mx.lastDurationMs, terminalId);
+      broadcastNote(midi.getTerminalChannel(terminalId), mx.lastText, mx.lastText, mx.lastDurationMs, terminalId);
     }
   }, mx.lastDurationMs);
 
@@ -1145,7 +1288,7 @@ function handleTextMessage(msg) {
       }
       // MIDI output: send melody notes to this terminal's channel
       midi.sendMelodyMIDI(sourceId, text, durationMs, getFreq, PUNCT_PERC);
-      broadcastNote(midi.getTerminalChannel(sourceId), text, durationMs, sourceId);
+      broadcastNote(midi.getTerminalChannel(sourceId), text, text, durationMs, sourceId);
     }, audioCtx);
   }
 
@@ -1289,6 +1432,27 @@ function createLane(sourceId, type, clipData) {
     btnLoop.className = 'clip-btn clip-loop';
     btnLoop.textContent = 'LOOP';
 
+    const densitySelect = document.createElement('select');
+    densitySelect.className = 'clip-density';
+    densitySelect.title = 'Note density / Euclidean rhythm';
+    const densityOpts = [
+      ['all',  'ALL'],
+      ['1/2',  '1/2'],
+      ['1/3',  '1/3'],
+      ['1/4',  '1/4'],
+      ['e3',   'E3'],
+      ['e5',   'E5'],
+      ['e7',   'E7'],
+      ['e9',   'E9'],
+      ['e11',  'E11'],
+    ];
+    for (const [val, label] of densityOpts) {
+      const opt = document.createElement('option');
+      opt.value = val;
+      opt.textContent = label;
+      densitySelect.appendChild(opt);
+    }
+
     // Wire controls
     btnLive.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -1321,6 +1485,20 @@ function createLane(sourceId, type, clipData) {
       }
     });
 
+    densitySelect.addEventListener('click', (e) => e.stopPropagation());
+    densitySelect.addEventListener('change', (e) => {
+      const clip = clips[clipId];
+      clip.density = e.target.value;
+      // Re-synthesize with new density for internal audio
+      resynthClip(clipId);
+      // If looping, restart the loop with new timing
+      if (clip.looping) {
+        stopClipLoop(clipId);
+        startClipLoop(clipId);
+        btnLoop.classList.add('active');
+      }
+    });
+
     // Cmd+click on lane = trigger this clip
     lane.addEventListener('click', (e) => {
       if (e.metaKey || e.ctrlKey) {
@@ -1339,6 +1517,7 @@ function createLane(sourceId, type, clipData) {
     controls.appendChild(btnLive);
     controls.appendChild(chSelect);
     controls.appendChild(btnLoop);
+    controls.appendChild(densitySelect);
     lane.appendChild(controls);
   } else {
     // Non-message lanes (dossier, event): just show face

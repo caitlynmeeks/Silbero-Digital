@@ -473,6 +473,23 @@ body {
 .clip-ch:hover { border-color: #3a6; }
 .clip-ch:focus { outline: none; border-color: #4c8; }
 
+.clip-density {
+  width: 100%;
+  padding: 2px 0;
+  background: #0a0a0a;
+  border: 1px solid #1a1a1a;
+  color: #a86;
+  font-family: inherit;
+  font-size: 8px;
+  font-weight: bold;
+  text-align: center;
+  cursor: pointer;
+  letter-spacing: 1px;
+}
+
+.clip-density:hover { border-color: #864; }
+.clip-density:focus { outline: none; border-color: #a86; }
+
 /* Lane with live clip */
 .op-lane.clip-live-on {
   border-left: 2px solid #a33;
